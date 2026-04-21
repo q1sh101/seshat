@@ -1,0 +1,19 @@
+[package]
+name = "seshatctl"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+publish = false
+
+[[bin]]
+name = "seshat"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+serde     = { version = "1", features = ["derive"] }
+toml      = "0.8"
+tempfile  = "3"
+thiserror = "1"
