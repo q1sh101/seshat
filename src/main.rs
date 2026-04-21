@@ -3,6 +3,7 @@
 mod cli;
 mod error;
 mod output;
+mod paths;
 mod result;
 
 fn main() {
