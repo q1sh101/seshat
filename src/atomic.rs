@@ -1,4 +1,3 @@
-//! Atomic root file installer: preflight + stage + rename + verify.
 
 use std::fs;
 use std::io::{self, Write};

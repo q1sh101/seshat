@@ -4,6 +4,7 @@ mod atomic;
 mod backup;
 mod cli;
 mod error;
+mod lock;
 mod output;
 mod paths;
 mod result;
