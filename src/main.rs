@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod backup;
 mod cli;
 mod error;
 mod output;
