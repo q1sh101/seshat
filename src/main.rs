@@ -5,6 +5,7 @@ mod error;
 mod output;
 mod paths;
 mod result;
+mod runtime;
 
 fn main() {
     let mut args: Vec<String> = Vec::new();
