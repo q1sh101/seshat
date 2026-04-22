@@ -13,6 +13,23 @@ pub const ALLOWLIST_SNAPSHOT: &str = "allowlist.snapshot.conf";
 pub const ALLOWLIST_ALLOW: &str = "allowlist.allow.conf";
 pub const ALLOWLIST_BLOCK: &str = "allowlist.block.conf";
 
+pub const SYSCTL_DROPIN: &str = "/etc/sysctl.d/99-kernel-hardening.conf";
+pub const MODPROBE_DROPIN: &str = "/etc/modprobe.d/99-kernel-hardening.conf";
+pub const GRUB_DROPIN: &str = "/etc/default/grub.d/99-kernel-hardening.cfg";
+pub const GRUB_CONFIG: &str = "/etc/default/grub";
+pub const GRUB_CFG: &str = "/boot/grub/grub.cfg";
+pub const KERNEL_CMDLINE: &str = "/etc/kernel/cmdline";
+
+pub const PROC_SYS: &str = "/proc/sys";
+pub const PROC_CMDLINE: &str = "/proc/cmdline";
+pub const PROC_MODULES_DISABLED: &str = "/proc/sys/kernel/modules_disabled";
+pub const SYS_LOCKDOWN: &str = "/sys/kernel/security/lockdown";
+pub const LIB_MODULES: &str = "/lib/modules";
+
+pub fn modules_dir(kernel_release: &str) -> PathBuf {
+    PathBuf::from(LIB_MODULES).join(kernel_release)
+}
+
 fn non_empty_env(name: &str) -> Option<OsString> {
     std::env::var_os(name).filter(|v| !v.is_empty())
 }
@@ -211,6 +228,31 @@ mod tests {
         assert_eq!(
             resolve_lock_root(None, None),
             Path::new("/tmp/seshat-locks")
+        );
+    }
+
+    #[test]
+    fn every_managed_target_is_absolute() {
+        for p in [
+            SYSCTL_DROPIN,
+            MODPROBE_DROPIN,
+            GRUB_DROPIN,
+            GRUB_CONFIG,
+            GRUB_CFG,
+            KERNEL_CMDLINE,
+        ] {
+            assert!(
+                Path::new(p).is_absolute(),
+                "managed target must be absolute: {p}"
+            );
+        }
+    }
+
+    #[test]
+    fn modules_dir_joins_release_under_lib_modules() {
+        assert_eq!(
+            modules_dir("6.8.0-test"),
+            Path::new("/lib/modules/6.8.0-test")
         );
     }
 }
