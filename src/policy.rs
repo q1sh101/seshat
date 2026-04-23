@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::Error;
 use crate::lock::current_uid;
 
+pub const SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
@@ -210,6 +212,19 @@ fn boot_arg_key(arg: &str) -> &str {
 }
 
 impl Profile {
+    pub fn check_schema_version(&self) -> Result<(), Error> {
+        if self.schema_version == SCHEMA_VERSION {
+            return Ok(());
+        }
+        Err(reject(
+            "schema_version",
+            format!(
+                "unsupported schema version {} (this build supports {}); upgrade seshat or migrate the profile",
+                self.schema_version, SCHEMA_VERSION
+            ),
+        ))
+    }
+
     pub fn check_duplicates(&self) -> Result<(), Error> {
         let mut sysctl_seen: HashSet<&str> = HashSet::new();
         for entry in &self.sysctl {
@@ -318,6 +333,7 @@ pub fn load_profile(path: &Path) -> Result<Profile, Error> {
         what: path.display().to_string(),
         reason: e.to_string(),
     })?;
+    profile.check_schema_version()?;
     profile.check_duplicates()?;
     Ok(profile)
 }
@@ -912,5 +928,50 @@ value = "3"
         assert_eq!(boot_arg_key("quiet"), "quiet");
         assert_eq!(boot_arg_key("lockdown=confidentiality"), "lockdown");
         assert_eq!(boot_arg_key("mitigations=auto,nosmt"), "mitigations");
+    }
+
+    #[test]
+    fn check_schema_version_accepts_current() {
+        let p = mk_profile(vec![], vec![], vec![]);
+        assert_eq!(p.schema_version, SCHEMA_VERSION);
+        p.check_schema_version().unwrap();
+    }
+
+    #[test]
+    fn check_schema_version_rejects_zero() {
+        let mut p = mk_profile(vec![], vec![], vec![]);
+        p.schema_version = 0;
+        match p.check_schema_version().unwrap_err() {
+            Error::Validation { field, reason } => {
+                assert_eq!(field, "schema_version");
+                assert!(reason.contains("unsupported"), "reason: {reason}");
+                assert!(reason.contains("upgrade") || reason.contains("migrate"));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_schema_version_rejects_future_versions() {
+        let mut p = mk_profile(vec![], vec![], vec![]);
+        p.schema_version = 2;
+        assert!(matches!(
+            p.check_schema_version().unwrap_err(),
+            Error::Validation { .. }
+        ));
+    }
+
+    #[test]
+    fn load_profile_surfaces_schema_version_mismatch() {
+        let dir = tempdir().unwrap();
+        let body = r#"
+schema_version = 99
+profile_name = "x"
+"#;
+        let path = write_profile(dir.path(), "future.toml", body);
+        match load_profile(&path).unwrap_err() {
+            Error::Validation { field, .. } => assert_eq!(field, "schema_version"),
+            other => panic!("expected Validation, got {other:?}"),
+        }
     }
 }
