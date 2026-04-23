@@ -31,7 +31,7 @@ fn parse_uid_from_status(text: &str) -> Result<u32, Error> {
 }
 
 // `/proc/self/status` stands in for `libc::getuid` because the crate forbids `unsafe_code`.
-fn current_uid() -> Result<u32, Error> {
+pub(crate) fn current_uid() -> Result<u32, Error> {
     parse_uid_from_status(&fs::read_to_string("/proc/self/status")?)
 }
 

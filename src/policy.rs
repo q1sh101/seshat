@@ -1,6 +1,11 @@
+use std::fs;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
+use crate::lock::current_uid;
 
 #[derive(Debug, Clone, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -192,6 +197,82 @@ impl BootArg {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+// TOCTOU boundary: compare opened-file metadata to preflight.
+fn same_inode(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+// SUDO_UID exists only when the kernel raised our euid; accepting it keeps
+// `sudo seshat deploy` usable against a profile kept under the invoker's home.
+fn sudo_uid() -> Option<u32> {
+    std::env::var("SUDO_UID").ok()?.parse().ok()
+}
+
+fn uid_is_acceptable(file_uid: u32, current: u32, sudo: Option<u32>) -> bool {
+    file_uid == 0 || file_uid == current || sudo.is_some_and(|s| file_uid == s)
+}
+
+pub fn load_profile(path: &Path) -> Result<Profile, Error> {
+    let preflight = fs::symlink_metadata(path)?;
+    let ft = preflight.file_type();
+    if ft.is_symlink() {
+        return Err(Error::UnsafePath {
+            path: path.to_path_buf(),
+            reason: "policy file is a symlink".to_string(),
+        });
+    }
+    if !ft.is_file() {
+        return Err(Error::UnsafePath {
+            path: path.to_path_buf(),
+            reason: "policy file is not a regular file".to_string(),
+        });
+    }
+    let mode = preflight.permissions().mode() & 0o777;
+    if mode & 0o022 != 0 {
+        return Err(Error::UnsafePath {
+            path: path.to_path_buf(),
+            reason: format!("policy file is group/world-writable (mode {mode:o})"),
+        });
+    }
+    let owner = preflight.uid();
+    if !uid_is_acceptable(owner, current_uid()?, sudo_uid()) {
+        return Err(Error::UnsafePath {
+            path: path.to_path_buf(),
+            reason: format!("policy file owner uid {owner} is not current/sudo/root"),
+        });
+    }
+
+    let mut file = fs::File::open(path)?;
+    let opened = file.metadata()?;
+    if !same_inode(&preflight, &opened) {
+        return Err(Error::UnsafePath {
+            path: path.to_path_buf(),
+            reason: "policy file changed between preflight and open".to_string(),
+        });
+    }
+    if !opened.file_type().is_file() {
+        return Err(Error::UnsafePath {
+            path: path.to_path_buf(),
+            reason: "opened policy file is not a regular file".to_string(),
+        });
+    }
+    let opened_mode = opened.permissions().mode() & 0o777;
+    if opened_mode & 0o022 != 0 {
+        return Err(Error::UnsafePath {
+            path: path.to_path_buf(),
+            reason: format!("opened policy file is group/world-writable (mode {opened_mode:o})"),
+        });
+    }
+
+    let mut text = String::new();
+    use std::io::Read;
+    file.read_to_string(&mut text)?;
+    toml::from_str(&text).map_err(|e| Error::Parse {
+        what: path.display().to_string(),
+        reason: e.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -528,5 +609,136 @@ profile_name = "x"
             Error::Validation { field, .. } => assert_eq!(field, "boot_arg"),
             other => panic!("expected Validation, got {other:?}"),
         }
+    }
+
+    use std::io::Write;
+    use tempfile::tempdir;
+
+    fn write_profile(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        let mut f = fs::File::create(&path).unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        path
+    }
+
+    const MIN_PROFILE: &str = r#"
+schema_version = 1
+profile_name = "baseline"
+
+[[sysctl]]
+key = "kernel.kptr_restrict"
+value = "2"
+"#;
+
+    #[test]
+    fn load_profile_returns_parsed_profile() {
+        let dir = tempdir().unwrap();
+        let path = write_profile(dir.path(), "baseline.toml", MIN_PROFILE);
+        let p = load_profile(&path).unwrap();
+        assert_eq!(p.profile_name, "baseline");
+        assert_eq!(p.sysctl.len(), 1);
+    }
+
+    #[test]
+    fn load_profile_rejects_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        let real = write_profile(dir.path(), "real.toml", MIN_PROFILE);
+        let link = dir.path().join("link.toml");
+        symlink(&real, &link).unwrap();
+        let err = load_profile(&link).unwrap_err();
+        assert!(matches!(err, Error::UnsafePath { .. }));
+    }
+
+    #[test]
+    fn load_profile_rejects_directory() {
+        let dir = tempdir().unwrap();
+        let sub = dir.path().join("subdir");
+        fs::create_dir(&sub).unwrap();
+        let err = load_profile(&sub).unwrap_err();
+        assert!(matches!(err, Error::UnsafePath { .. }));
+    }
+
+    #[test]
+    fn load_profile_rejects_group_writable() {
+        let dir = tempdir().unwrap();
+        let path = write_profile(dir.path(), "baseline.toml", MIN_PROFILE);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).unwrap();
+        let err = load_profile(&path).unwrap_err();
+        assert!(matches!(err, Error::UnsafePath { .. }));
+    }
+
+    #[test]
+    fn load_profile_rejects_world_writable() {
+        let dir = tempdir().unwrap();
+        let path = write_profile(dir.path(), "baseline.toml", MIN_PROFILE);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o646)).unwrap();
+        let err = load_profile(&path).unwrap_err();
+        assert!(matches!(err, Error::UnsafePath { .. }));
+    }
+
+    #[test]
+    fn load_profile_maps_parse_failure_to_parse_variant() {
+        let dir = tempdir().unwrap();
+        let path = write_profile(dir.path(), "bad.toml", "not = valid = toml");
+        match load_profile(&path).unwrap_err() {
+            Error::Parse { what, .. } => assert!(what.contains("bad.toml")),
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_profile_maps_missing_file_to_io_error() {
+        let dir = tempdir().unwrap();
+        let err = load_profile(&dir.path().join("missing.toml")).unwrap_err();
+        assert!(matches!(err, Error::Io(_)));
+    }
+
+    #[test]
+    fn load_profile_rejects_unknown_field_via_deny_unknown() {
+        let dir = tempdir().unwrap();
+        let body = r#"
+schema_version = 1
+profile_name = "x"
+surprise = true
+"#;
+        let path = write_profile(dir.path(), "bad.toml", body);
+        assert!(matches!(
+            load_profile(&path).unwrap_err(),
+            Error::Parse { .. }
+        ));
+    }
+
+    #[test]
+    fn same_inode_true_for_same_file() {
+        let dir = tempdir().unwrap();
+        let path = write_profile(dir.path(), "a.toml", MIN_PROFILE);
+        let a = fs::symlink_metadata(&path).unwrap();
+        let b = fs::File::open(&path).unwrap().metadata().unwrap();
+        assert!(same_inode(&a, &b));
+    }
+
+    #[test]
+    fn same_inode_false_across_distinct_files() {
+        let dir = tempdir().unwrap();
+        let a_path = write_profile(dir.path(), "a.toml", MIN_PROFILE);
+        let b_path = write_profile(dir.path(), "b.toml", MIN_PROFILE);
+        let a = fs::symlink_metadata(&a_path).unwrap();
+        let b = fs::symlink_metadata(&b_path).unwrap();
+        assert!(!same_inode(&a, &b));
+    }
+
+    #[test]
+    fn uid_is_acceptable_accepts_root_current_and_sudo() {
+        assert!(uid_is_acceptable(0, 1000, Some(1000)));
+        assert!(uid_is_acceptable(1000, 1000, None));
+        assert!(uid_is_acceptable(1000, 0, Some(1000)));
+    }
+
+    #[test]
+    fn uid_is_acceptable_rejects_unrelated_uid() {
+        assert!(!uid_is_acceptable(1234, 1000, None));
+        assert!(!uid_is_acceptable(1234, 0, Some(1000)));
     }
 }
