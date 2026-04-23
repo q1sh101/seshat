@@ -7,6 +7,7 @@ mod error;
 mod lock;
 mod output;
 mod paths;
+mod policy;
 mod result;
 mod runtime;
 
