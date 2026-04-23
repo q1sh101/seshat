@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::error::Error;
+
 #[derive(Debug, Clone, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
@@ -42,6 +44,154 @@ pub struct BootEntry {
 pub struct LockdownSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expect: Option<String>,
+}
+
+fn reject(field: &'static str, reason: impl Into<String>) -> Error {
+    Error::Validation {
+        field: field.to_string(),
+        reason: reason.into(),
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct ProfileName(String);
+
+impl ProfileName {
+    pub fn new(s: &str) -> Result<Self, Error> {
+        if s.is_empty() {
+            return Err(reject("profile_name", "empty"));
+        }
+        if !s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(reject(
+                "profile_name",
+                format!("must match ^[A-Za-z0-9_-]+$: {s:?}"),
+            ));
+        }
+        Ok(Self(s.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct SysctlKey(String);
+
+impl SysctlKey {
+    pub fn new(s: &str) -> Result<Self, Error> {
+        if s.len() < 2 {
+            return Err(reject("sysctl_key", "must be at least two characters"));
+        }
+        let mut chars = s.chars();
+        let first = chars.next().unwrap();
+        if !first.is_ascii_lowercase() {
+            return Err(reject(
+                "sysctl_key",
+                format!("first character must be a-z: {s:?}"),
+            ));
+        }
+        for c in chars {
+            let ok =
+                c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.' || c == '-';
+            if !ok {
+                return Err(reject(
+                    "sysctl_key",
+                    format!("must match ^[a-z][a-z0-9_.-]+$: {s:?}"),
+                ));
+            }
+        }
+        Ok(Self(s.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct SysctlValue(String);
+
+impl SysctlValue {
+    pub fn new(s: &str) -> Result<Self, Error> {
+        if s.is_empty() {
+            return Err(reject("sysctl_value", "empty"));
+        }
+        if s.starts_with(char::is_whitespace) || s.ends_with(char::is_whitespace) {
+            return Err(reject(
+                "sysctl_value",
+                "leading or trailing whitespace not allowed",
+            ));
+        }
+        for c in s.chars() {
+            let ok =
+                c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ',' | '|' | '/' | ' ');
+            if !ok {
+                return Err(reject(
+                    "sysctl_value",
+                    format!("disallowed character {c:?} in {s:?}"),
+                ));
+            }
+        }
+        Ok(Self(s.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct ModuleName(String);
+
+impl ModuleName {
+    pub fn new(s: &str) -> Result<Self, Error> {
+        if s.is_empty() {
+            return Err(reject("module_name", "empty"));
+        }
+        if !s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(reject(
+                "module_name",
+                format!("must match ^[A-Za-z0-9_-]+$: {s:?}"),
+            ));
+        }
+        Ok(Self(s.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct BootArg(String);
+
+impl BootArg {
+    pub fn new(s: &str) -> Result<Self, Error> {
+        if s.is_empty() {
+            return Err(reject("boot_arg", "empty"));
+        }
+        for c in s.chars() {
+            let ok = c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '=' | ',' | '-');
+            if !ok {
+                return Err(reject(
+                    "boot_arg",
+                    format!("must match ^[A-Za-z0-9_.=,-]+$: {s:?}"),
+                ));
+            }
+        }
+        Ok(Self(s.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[cfg(test)]
@@ -247,5 +397,136 @@ profile_name = "x"
         let serialised = toml::to_string(&original).unwrap();
         let parsed: Profile = toml::from_str(&serialised).unwrap();
         assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn profile_name_accepts_plan_charset() {
+        assert_eq!(ProfileName::new("baseline").unwrap().as_str(), "baseline");
+        assert_eq!(ProfileName::new("Mix_42-x").unwrap().as_str(), "Mix_42-x");
+    }
+
+    #[test]
+    fn profile_name_rejects_empty_and_bad_chars() {
+        assert!(ProfileName::new("").is_err());
+        assert!(ProfileName::new("has space").is_err());
+        assert!(ProfileName::new("dot.is.bad").is_err());
+        assert!(ProfileName::new("../escape").is_err());
+        assert!(ProfileName::new("shell$ubst").is_err());
+    }
+
+    #[test]
+    fn sysctl_key_accepts_dotted_lowercase_names() {
+        assert_eq!(
+            SysctlKey::new("kernel.kptr_restrict").unwrap().as_str(),
+            "kernel.kptr_restrict"
+        );
+        assert_eq!(
+            SysctlKey::new("net.ipv4.conf.all.rp_filter")
+                .unwrap()
+                .as_str(),
+            "net.ipv4.conf.all.rp_filter"
+        );
+    }
+
+    #[test]
+    fn sysctl_key_rejects_uppercase_digit_or_empty_start() {
+        assert!(SysctlKey::new("").is_err());
+        assert!(SysctlKey::new("a").is_err());
+        assert!(SysctlKey::new("Kernel.kptr").is_err());
+        assert!(SysctlKey::new("1kernel").is_err());
+        assert!(SysctlKey::new(".kernel").is_err());
+        assert!(SysctlKey::new("kernel kptr").is_err());
+    }
+
+    #[test]
+    fn sysctl_value_accepts_baseline_forms() {
+        assert_eq!(SysctlValue::new("2").unwrap().as_str(), "2");
+        assert_eq!(SysctlValue::new("3 3 3 3").unwrap().as_str(), "3 3 3 3");
+        assert_eq!(
+            SysctlValue::new("|/bin/false").unwrap().as_str(),
+            "|/bin/false"
+        );
+        assert_eq!(
+            SysctlValue::new("full,force").unwrap().as_str(),
+            "full,force"
+        );
+    }
+
+    #[test]
+    fn sysctl_value_rejects_empty_trim_and_shell_metacharacters() {
+        assert!(SysctlValue::new("").is_err());
+        assert!(SysctlValue::new(" leading").is_err());
+        assert!(SysctlValue::new("trailing ").is_err());
+        assert!(SysctlValue::new("bad;semi").is_err());
+        assert!(SysctlValue::new("bad`tick").is_err());
+        assert!(SysctlValue::new("bad$var").is_err());
+        assert!(SysctlValue::new("bad&bg").is_err());
+        assert!(SysctlValue::new("bad>redir").is_err());
+        assert!(SysctlValue::new("bad\"quote").is_err());
+    }
+
+    #[test]
+    fn module_name_accepts_plan_charset() {
+        assert_eq!(
+            ModuleName::new("usb_storage").unwrap().as_str(),
+            "usb_storage"
+        );
+        assert_eq!(ModuleName::new("nf-nat").unwrap().as_str(), "nf-nat");
+        assert_eq!(ModuleName::new("vfat").unwrap().as_str(), "vfat");
+    }
+
+    #[test]
+    fn module_name_rejects_empty_and_bad_chars() {
+        assert!(ModuleName::new("").is_err());
+        assert!(ModuleName::new("has space").is_err());
+        assert!(ModuleName::new("dot.bad").is_err());
+        assert!(ModuleName::new("sub/path").is_err());
+    }
+
+    #[test]
+    fn boot_arg_accepts_plan_charset() {
+        assert_eq!(
+            BootArg::new("lockdown=confidentiality").unwrap().as_str(),
+            "lockdown=confidentiality"
+        );
+        assert_eq!(
+            BootArg::new("mitigations=auto,nosmt").unwrap().as_str(),
+            "mitigations=auto,nosmt"
+        );
+        assert_eq!(BootArg::new("quiet").unwrap().as_str(), "quiet");
+    }
+
+    #[test]
+    fn boot_arg_rejects_empty_space_and_shell_metacharacters() {
+        assert!(BootArg::new("").is_err());
+        assert!(BootArg::new("has space").is_err());
+        assert!(BootArg::new("with;semi").is_err());
+        assert!(BootArg::new("with|pipe").is_err());
+        assert!(BootArg::new("with/slash").is_err());
+        assert!(BootArg::new("with$var").is_err());
+    }
+
+    #[test]
+    fn validation_errors_name_the_field() {
+        match ProfileName::new("").unwrap_err() {
+            Error::Validation { field, .. } => assert_eq!(field, "profile_name"),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        match SysctlKey::new("").unwrap_err() {
+            Error::Validation { field, .. } => assert_eq!(field, "sysctl_key"),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        match SysctlValue::new("").unwrap_err() {
+            Error::Validation { field, .. } => assert_eq!(field, "sysctl_value"),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        match ModuleName::new("").unwrap_err() {
+            Error::Validation { field, .. } => assert_eq!(field, "module_name"),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        match BootArg::new("").unwrap_err() {
+            Error::Validation { field, .. } => assert_eq!(field, "boot_arg"),
+            other => panic!("expected Validation, got {other:?}"),
+        }
     }
 }
