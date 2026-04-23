@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
@@ -199,6 +200,50 @@ impl BootArg {
     }
 }
 
+// Kernel treats '-' and '_' as equivalent in module names.
+fn normalize_module(name: &str) -> String {
+    name.replace('-', "_")
+}
+
+fn boot_arg_key(arg: &str) -> &str {
+    arg.split_once('=').map(|(k, _)| k).unwrap_or(arg)
+}
+
+impl Profile {
+    pub fn check_duplicates(&self) -> Result<(), Error> {
+        let mut sysctl_seen: HashSet<&str> = HashSet::new();
+        for entry in &self.sysctl {
+            if !sysctl_seen.insert(entry.key.as_str()) {
+                return Err(reject("sysctl", format!("duplicate key {:?}", entry.key)));
+            }
+        }
+
+        let mut module_seen: HashSet<String> = HashSet::new();
+        for name in &self.modules.block {
+            let normal = normalize_module(name);
+            if !module_seen.insert(normal.clone()) {
+                return Err(reject(
+                    "modules.block",
+                    format!("duplicate module {name:?} (normalizes to {normal:?})"),
+                ));
+            }
+        }
+
+        let mut boot_seen: HashSet<&str> = HashSet::new();
+        for entry in &self.boot {
+            let key = boot_arg_key(&entry.arg);
+            if !boot_seen.insert(key) {
+                return Err(reject(
+                    "boot",
+                    format!("conflicting boot args for key {key:?}"),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
 // TOCTOU boundary: compare opened-file metadata to preflight.
 fn same_inode(a: &fs::Metadata, b: &fs::Metadata) -> bool {
     a.dev() == b.dev() && a.ino() == b.ino()
@@ -269,10 +314,12 @@ pub fn load_profile(path: &Path) -> Result<Profile, Error> {
     let mut text = String::new();
     use std::io::Read;
     file.read_to_string(&mut text)?;
-    toml::from_str(&text).map_err(|e| Error::Parse {
+    let profile: Profile = toml::from_str(&text).map_err(|e| Error::Parse {
         what: path.display().to_string(),
         reason: e.to_string(),
-    })
+    })?;
+    profile.check_duplicates()?;
+    Ok(profile)
 }
 
 #[cfg(test)]
@@ -740,5 +787,130 @@ surprise = true
     fn uid_is_acceptable_rejects_unrelated_uid() {
         assert!(!uid_is_acceptable(1234, 1000, None));
         assert!(!uid_is_acceptable(1234, 0, Some(1000)));
+    }
+
+    fn mk_profile(sysctl: Vec<SysctlEntry>, block: Vec<&str>, boot: Vec<&str>) -> Profile {
+        Profile {
+            schema_version: 1,
+            profile_name: "x".to_string(),
+            modules: ModulesSection {
+                mode: None,
+                block: block.into_iter().map(String::from).collect(),
+            },
+            sysctl,
+            boot: boot
+                .into_iter()
+                .map(|a| BootEntry { arg: a.to_string() })
+                .collect(),
+            lockdown: LockdownSection::default(),
+        }
+    }
+
+    #[test]
+    fn check_duplicates_accepts_unique_entries() {
+        let p = mk_profile(
+            vec![
+                SysctlEntry {
+                    key: "kernel.kptr_restrict".to_string(),
+                    value: "2".to_string(),
+                },
+                SysctlEntry {
+                    key: "kernel.dmesg_restrict".to_string(),
+                    value: "1".to_string(),
+                },
+            ],
+            vec!["usb-storage", "firewire_core"],
+            vec!["lockdown=confidentiality", "quiet"],
+        );
+        p.check_duplicates().unwrap();
+    }
+
+    #[test]
+    fn check_duplicates_rejects_duplicate_sysctl_key() {
+        let p = mk_profile(
+            vec![
+                SysctlEntry {
+                    key: "kernel.kptr_restrict".to_string(),
+                    value: "2".to_string(),
+                },
+                SysctlEntry {
+                    key: "kernel.kptr_restrict".to_string(),
+                    value: "3".to_string(),
+                },
+            ],
+            vec![],
+            vec![],
+        );
+        match p.check_duplicates().unwrap_err() {
+            Error::Validation { field, .. } => assert_eq!(field, "sysctl"),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_duplicates_rejects_modules_after_normalization() {
+        let p = mk_profile(vec![], vec!["usb-storage", "usb_storage"], vec![]);
+        match p.check_duplicates().unwrap_err() {
+            Error::Validation { field, .. } => assert_eq!(field, "modules.block"),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_duplicates_rejects_conflicting_boot_args_same_key() {
+        let p = mk_profile(
+            vec![],
+            vec![],
+            vec!["lockdown=confidentiality", "lockdown=integrity"],
+        );
+        match p.check_duplicates().unwrap_err() {
+            Error::Validation { field, .. } => assert_eq!(field, "boot"),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_duplicates_rejects_repeated_bare_boot_arg() {
+        let p = mk_profile(vec![], vec![], vec!["quiet", "quiet"]);
+        assert!(matches!(
+            p.check_duplicates().unwrap_err(),
+            Error::Validation { .. }
+        ));
+    }
+
+    #[test]
+    fn load_profile_surfaces_duplicate_sysctl_key() {
+        let dir = tempdir().unwrap();
+        let body = r#"
+schema_version = 1
+profile_name = "x"
+
+[[sysctl]]
+key = "kernel.kptr_restrict"
+value = "2"
+
+[[sysctl]]
+key = "kernel.kptr_restrict"
+value = "3"
+"#;
+        let path = write_profile(dir.path(), "dup.toml", body);
+        assert!(matches!(
+            load_profile(&path).unwrap_err(),
+            Error::Validation { .. }
+        ));
+    }
+
+    #[test]
+    fn normalize_module_is_idempotent_on_underscores() {
+        assert_eq!(normalize_module("usb_storage"), "usb_storage");
+        assert_eq!(normalize_module("usb-storage"), "usb_storage");
+        assert_eq!(normalize_module("nf-nat-ipv4"), "nf_nat_ipv4");
+    }
+
+    #[test]
+    fn boot_arg_key_splits_on_first_equals() {
+        assert_eq!(boot_arg_key("quiet"), "quiet");
+        assert_eq!(boot_arg_key("lockdown=confidentiality"), "lockdown");
+        assert_eq!(boot_arg_key("mitigations=auto,nosmt"), "mitigations");
     }
 }
