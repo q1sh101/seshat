@@ -1,7 +1,8 @@
+use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 
 use crate::error::Error;
-use crate::policy::{ModuleName, safe_policy_read};
+use crate::policy::{ModuleName, normalize_module, safe_policy_read};
 
 pub fn parse_allowlist(path: &Path) -> Result<Vec<ModuleName>, Error> {
     let text = safe_policy_read(path)?;
@@ -14,6 +15,25 @@ pub fn parse_allowlist(path: &Path) -> Result<Vec<ModuleName>, Error> {
         modules.push(ModuleName::new(line)?);
     }
     Ok(modules)
+}
+
+pub fn effective_allowlist(
+    snapshot: &[ModuleName],
+    allow: &[ModuleName],
+    block: &[ModuleName],
+) -> Vec<ModuleName> {
+    let blocked: HashSet<String> = block.iter().map(|m| normalize_module(m.as_str())).collect();
+    let mut effective: BTreeSet<String> = BTreeSet::new();
+    for m in snapshot.iter().chain(allow.iter()) {
+        let normal = normalize_module(m.as_str());
+        if !blocked.contains(&normal) {
+            effective.insert(normal);
+        }
+    }
+    effective
+        .into_iter()
+        .map(|s| ModuleName::new(&s).expect("normalized module name is always valid"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -150,5 +170,81 @@ mod tests {
             parse_allowlist(&dir.path().join("missing.conf")).unwrap_err(),
             Error::Io(_)
         ));
+    }
+
+    fn mods(names: &[&str]) -> Vec<ModuleName> {
+        names.iter().map(|n| ModuleName::new(n).unwrap()).collect()
+    }
+
+    fn as_str_vec(v: &[ModuleName]) -> Vec<&str> {
+        v.iter().map(|m| m.as_str()).collect()
+    }
+
+    #[test]
+    fn effective_empty_inputs_produce_empty_output() {
+        assert!(effective_allowlist(&[], &[], &[]).is_empty());
+    }
+
+    #[test]
+    fn effective_snapshot_only_is_returned_sorted() {
+        let out = effective_allowlist(&mods(&["vfat", "ext4", "btrfs"]), &[], &[]);
+        assert_eq!(as_str_vec(&out), vec!["btrfs", "ext4", "vfat"]);
+    }
+
+    #[test]
+    fn effective_union_of_snapshot_and_allow() {
+        let out = effective_allowlist(&mods(&["ext4"]), &mods(&["vfat"]), &[]);
+        assert_eq!(as_str_vec(&out), vec!["ext4", "vfat"]);
+    }
+
+    #[test]
+    fn effective_block_removes_from_snapshot() {
+        let out = effective_allowlist(
+            &mods(&["usb_storage", "ext4"]),
+            &[],
+            &mods(&["usb_storage"]),
+        );
+        assert_eq!(as_str_vec(&out), vec!["ext4"]);
+    }
+
+    #[test]
+    fn effective_block_removes_from_allow() {
+        let out = effective_allowlist(&[], &mods(&["usb_storage"]), &mods(&["usb_storage"]));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn effective_block_wins_when_allow_and_block_collide() {
+        let out = effective_allowlist(
+            &mods(&["ext4"]),
+            &mods(&["usb_storage"]),
+            &mods(&["usb_storage"]),
+        );
+        assert_eq!(as_str_vec(&out), vec!["ext4"]);
+    }
+
+    #[test]
+    fn effective_hyphen_underscore_normalization_blocks_match() {
+        let out = effective_allowlist(&mods(&["usb-storage"]), &[], &mods(&["usb_storage"]));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn effective_deduplicates_repeated_entries() {
+        let out = effective_allowlist(&mods(&["vfat", "vfat", "vfat"]), &mods(&["vfat"]), &[]);
+        assert_eq!(as_str_vec(&out), vec!["vfat"]);
+    }
+
+    #[test]
+    fn effective_output_uses_normalized_form() {
+        let out = effective_allowlist(&mods(&["usb-storage"]), &[], &[]);
+        assert_eq!(as_str_vec(&out), vec!["usb_storage"]);
+    }
+
+    #[test]
+    fn effective_output_is_deterministic_across_input_orders() {
+        let a = effective_allowlist(&mods(&["a", "c", "b"]), &mods(&["e", "d"]), &mods(&["b"]));
+        let b = effective_allowlist(&mods(&["c", "b", "a"]), &mods(&["d", "e"]), &mods(&["b"]));
+        assert_eq!(as_str_vec(&a), as_str_vec(&b));
     }
 }

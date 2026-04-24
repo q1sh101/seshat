@@ -203,7 +203,7 @@ impl BootArg {
 }
 
 // Kernel treats '-' and '_' as equivalent in module names.
-fn normalize_module(name: &str) -> String {
+pub(crate) fn normalize_module(name: &str) -> String {
     name.replace('-', "_")
 }
 
