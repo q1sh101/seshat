@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use crate::atomic::install_root_file;
+use crate::backup::create_backup;
 use crate::error::Error;
 use crate::policy::{ModuleName, normalize_module};
 
@@ -57,19 +59,17 @@ fn render_snapshot(modules: &BTreeSet<String>, kernel_release: &str) -> String {
 }
 
 // resolve_deps returns None when modinfo is unavailable.
-pub fn create_snapshot<F>(
-    dest: &std::path::Path,
-    proc_modules_path: &std::path::Path,
-    modules_dir: &std::path::Path,
+fn gather_snapshot<F>(
+    proc_modules_path: &Path,
+    modules_dir: &Path,
     kernel_release: &str,
     mut resolve_deps: F,
-) -> Result<SnapshotSummary, Error>
+) -> Result<(String, SnapshotSummary), Error>
 where
     F: FnMut(&str) -> Option<Vec<String>>,
 {
     use std::fs;
-    use std::io::{self, Write};
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::io;
 
     let loaded_text = fs::read_to_string(proc_modules_path)?;
     let loaded = parse_proc_modules(&loaded_text);
@@ -103,6 +103,33 @@ where
     let total = all.len();
 
     let payload = render_snapshot(&all, kernel_release);
+    Ok((
+        payload,
+        SnapshotSummary {
+            loaded: loaded_count,
+            builtin: builtin_count,
+            deps: dep_count,
+            total,
+        },
+    ))
+}
+
+pub fn create_snapshot<F>(
+    dest: &Path,
+    proc_modules_path: &Path,
+    modules_dir: &Path,
+    kernel_release: &str,
+    resolve_deps: F,
+) -> Result<SnapshotSummary, Error>
+where
+    F: FnMut(&str) -> Option<Vec<String>>,
+{
+    use std::fs;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let (payload, summary) =
+        gather_snapshot(proc_modules_path, modules_dir, kernel_release, resolve_deps)?;
 
     // create_new enforces create-or-fail: exists -> AlreadyExists.
     let mut file = fs::OpenOptions::new()
@@ -116,11 +143,34 @@ where
         fs::File::open(parent)?.sync_all()?;
     }
 
-    Ok(SnapshotSummary {
-        loaded: loaded_count,
-        builtin: builtin_count,
-        deps: dep_count,
-        total,
+    Ok(summary)
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ResetSummary {
+    pub snapshot: SnapshotSummary,
+    pub backup: Option<PathBuf>,
+}
+
+// reset overwrites snapshot only; allow/block overlays are never touched.
+pub fn reset_snapshot<F>(
+    dest: &Path,
+    proc_modules_path: &Path,
+    modules_dir: &Path,
+    kernel_release: &str,
+    backup_dir: &Path,
+    resolve_deps: F,
+) -> Result<ResetSummary, Error>
+where
+    F: FnMut(&str) -> Option<Vec<String>>,
+{
+    let backup = create_backup(dest, backup_dir)?;
+    let (payload, summary) =
+        gather_snapshot(proc_modules_path, modules_dir, kernel_release, resolve_deps)?;
+    install_root_file(dest, payload.as_bytes(), 0o600)?;
+    Ok(ResetSummary {
+        snapshot: summary,
+        backup,
     })
 }
 
@@ -346,6 +396,116 @@ vfat\n";
 
         let dest = dir.path().join("snap.conf");
         create_snapshot(&dest, &proc_modules, &mods_dir, "6.8.0", |_| Some(vec![])).unwrap();
+        let mode = fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    fn scratch_snapshot_env(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let proc_modules = dir.join("proc_modules");
+        write(&proc_modules, "ext4 0 0 - Live 0x0\n");
+        let mods_dir = dir.join("lib/modules/test");
+        fs::create_dir_all(&mods_dir).unwrap();
+        let backup_dir = dir.join("backups/modules");
+        fs::create_dir_all(&backup_dir).unwrap();
+        (proc_modules, mods_dir, backup_dir)
+    }
+
+    #[test]
+    fn reset_snapshot_with_no_prior_snapshot_has_no_backup() {
+        let dir = tempdir().unwrap();
+        let (proc_modules, mods_dir, backup_dir) = scratch_snapshot_env(dir.path());
+        let dest = dir.path().join("snapshot.conf");
+
+        let summary = reset_snapshot(
+            &dest,
+            &proc_modules,
+            &mods_dir,
+            "6.8.0",
+            &backup_dir,
+            |_| Some(vec![]),
+        )
+        .unwrap();
+
+        assert!(summary.backup.is_none());
+        assert_eq!(summary.snapshot.total, 1);
+        assert!(dest.exists());
+    }
+
+    #[test]
+    fn reset_snapshot_backs_up_prior_and_overwrites() {
+        let dir = tempdir().unwrap();
+        let (proc_modules, mods_dir, backup_dir) = scratch_snapshot_env(dir.path());
+        let dest = dir.path().join("snapshot.conf");
+
+        create_snapshot(&dest, &proc_modules, &mods_dir, "6.8.0", |_| Some(vec![])).unwrap();
+        let old_bytes = fs::read(&dest).unwrap();
+
+        write(&proc_modules, "ext4 0 0 - Live 0x0\nvfat 0 0 - Live 0x0\n");
+        let summary = reset_snapshot(
+            &dest,
+            &proc_modules,
+            &mods_dir,
+            "6.8.0",
+            &backup_dir,
+            |_| Some(vec![]),
+        )
+        .unwrap();
+
+        let backup_path = summary.backup.expect("backup path returned");
+        assert_eq!(backup_path.parent().unwrap(), backup_dir);
+        assert_eq!(fs::read(&backup_path).unwrap(), old_bytes);
+
+        let new_bytes = fs::read(&dest).unwrap();
+        assert_ne!(new_bytes, old_bytes);
+        assert_eq!(summary.snapshot.total, 2);
+    }
+
+    #[test]
+    fn reset_snapshot_preserves_allow_and_block_overlays() {
+        let dir = tempdir().unwrap();
+        let (proc_modules, mods_dir, backup_dir) = scratch_snapshot_env(dir.path());
+        let snapshot = dir.path().join("allowlist.snapshot.conf");
+        let allow = dir.path().join("allowlist.allow.conf");
+        let block = dir.path().join("allowlist.block.conf");
+
+        create_snapshot(&snapshot, &proc_modules, &mods_dir, "6.8.0", |_| {
+            Some(vec![])
+        })
+        .unwrap();
+        write(&allow, "vfat\n");
+        write(&block, "usb_storage\n");
+        let allow_before = fs::read(&allow).unwrap();
+        let block_before = fs::read(&block).unwrap();
+
+        reset_snapshot(
+            &snapshot,
+            &proc_modules,
+            &mods_dir,
+            "6.8.0",
+            &backup_dir,
+            |_| Some(vec![]),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(&allow).unwrap(), allow_before);
+        assert_eq!(fs::read(&block).unwrap(), block_before);
+    }
+
+    #[test]
+    fn reset_snapshot_writes_mode_0o600() {
+        let dir = tempdir().unwrap();
+        let (proc_modules, mods_dir, backup_dir) = scratch_snapshot_env(dir.path());
+        let dest = dir.path().join("snapshot.conf");
+
+        reset_snapshot(
+            &dest,
+            &proc_modules,
+            &mods_dir,
+            "6.8.0",
+            &backup_dir,
+            |_| Some(vec![]),
+        )
+        .unwrap();
         let mode = fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
     }
