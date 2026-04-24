@@ -1,4 +1,3 @@
-
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum Domain {
     All,

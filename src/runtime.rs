@@ -118,7 +118,6 @@ mod tests {
         assert!(summary.is_char_boundary(summary.len()));
     }
 
-
     fn selected_exactly(name: &str) -> bool {
         let args: Vec<String> = std::env::args().collect();
         if !args.iter().any(|a| a == "--exact") {

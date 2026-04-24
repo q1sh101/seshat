@@ -1,4 +1,3 @@
-
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};

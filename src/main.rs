@@ -5,6 +5,7 @@ mod backup;
 mod cli;
 mod error;
 mod lock;
+mod modules;
 mod output;
 mod paths;
 mod policy;

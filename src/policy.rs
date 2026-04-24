@@ -313,7 +313,7 @@ fn uid_is_acceptable(file_uid: u32, current: u32, sudo: Option<u32>) -> bool {
     file_uid == 0 || file_uid == current || sudo.is_some_and(|s| file_uid == s)
 }
 
-pub fn load_profile(path: &Path) -> Result<Profile, Error> {
+pub(crate) fn safe_policy_read(path: &Path) -> Result<String, Error> {
     let preflight = fs::symlink_metadata(path)?;
     let ft = preflight.file_type();
     if ft.is_symlink() {
@@ -368,6 +368,11 @@ pub fn load_profile(path: &Path) -> Result<Profile, Error> {
     let mut text = String::new();
     use std::io::Read;
     file.read_to_string(&mut text)?;
+    Ok(text)
+}
+
+pub fn load_profile(path: &Path) -> Result<Profile, Error> {
+    let text = safe_policy_read(path)?;
     let profile: Profile = toml::from_str(&text).map_err(|e| Error::Parse {
         what: path.display().to_string(),
         reason: e.to_string(),
