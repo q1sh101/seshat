@@ -1,0 +1,82 @@
+# Example hardening profile.
+
+schema_version = 1
+profile_name = "baseline"
+
+[modules]
+mode = "allowlist"
+block = []
+
+[lockdown]
+expect = "confidentiality"
+
+# --- kernel: pointer & info leak prevention ---
+
+[[sysctl]]
+key = "kernel.kptr_restrict"
+value = "2"
+
+[[sysctl]]
+key = "kernel.dmesg_restrict"
+value = "1"
+
+# --- sysctl: unprivileged attack surface ---
+
+[[sysctl]]
+key = "kernel.unprivileged_bpf_disabled"
+value = "1"
+
+[[sysctl]]
+key = "net.core.bpf_jit_harden"
+value = "2"
+
+# --- sysctl: process isolation ---
+
+[[sysctl]]
+key = "kernel.yama.ptrace_scope"
+value = "2"
+
+# --- sysctl: filesystem race protections ---
+
+[[sysctl]]
+key = "fs.protected_hardlinks"
+value = "1"
+
+[[sysctl]]
+key = "fs.protected_symlinks"
+value = "1"
+
+[[sysctl]]
+key = "fs.protected_fifos"
+value = "2"
+
+[[sysctl]]
+key = "fs.protected_regular"
+value = "2"
+
+# --- boot: memory initialization ---
+
+[[boot]]
+arg = "init_on_alloc=1"
+
+[[boot]]
+arg = "init_on_free=1"
+
+# --- boot: kernel self-protection ---
+
+[[boot]]
+arg = "debugfs=off"
+
+[[boot]]
+arg = "lockdown=confidentiality"
+
+[[boot]]
+arg = "module.sig_enforce=1"
+
+# --- boot: DMA isolation ---
+
+[[boot]]
+arg = "iommu=force"
+
+[[boot]]
+arg = "iommu.strict=1"

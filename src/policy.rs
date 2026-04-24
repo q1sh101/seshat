@@ -212,6 +212,45 @@ fn boot_arg_key(arg: &str) -> &str {
 }
 
 impl Profile {
+    pub fn validate_content(&self) -> Result<(), Error> {
+        ProfileName::new(&self.profile_name)?;
+
+        if let Some(mode) = self.modules.mode.as_deref()
+            && mode != "allowlist"
+        {
+            return Err(reject(
+                "modules.mode",
+                format!("unsupported mode {mode:?}; expected \"allowlist\""),
+            ));
+        }
+
+        for name in &self.modules.block {
+            ModuleName::new(name)?;
+        }
+
+        for entry in &self.sysctl {
+            SysctlKey::new(&entry.key)?;
+            SysctlValue::new(&entry.value)?;
+        }
+
+        for entry in &self.boot {
+            BootArg::new(&entry.arg)?;
+        }
+
+        if let Some(expect) = self.lockdown.expect.as_deref()
+            && !matches!(expect, "none" | "integrity" | "confidentiality")
+        {
+            return Err(reject(
+                "lockdown.expect",
+                format!(
+                    "unknown value {expect:?}; expected \"none\", \"integrity\", or \"confidentiality\""
+                ),
+            ));
+        }
+
+        Ok(())
+    }
+
     pub fn check_schema_version(&self) -> Result<(), Error> {
         if self.schema_version == SCHEMA_VERSION {
             return Ok(());
@@ -334,6 +373,7 @@ pub fn load_profile(path: &Path) -> Result<Profile, Error> {
         reason: e.to_string(),
     })?;
     profile.check_schema_version()?;
+    profile.validate_content()?;
     profile.check_duplicates()?;
     Ok(profile)
 }
@@ -972,6 +1012,156 @@ profile_name = "x"
         match load_profile(&path).unwrap_err() {
             Error::Validation { field, .. } => assert_eq!(field, "schema_version"),
             other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn baseline_fixture_parses_and_validates() {
+        let path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("profiles/baseline.toml");
+        let profile = load_profile(&path).expect("baseline.toml must load cleanly");
+        assert_eq!(profile.schema_version, SCHEMA_VERSION);
+        assert_eq!(profile.profile_name, "baseline");
+        assert_eq!(profile.modules.mode.as_deref(), Some("allowlist"));
+        assert_eq!(profile.lockdown.expect.as_deref(), Some("confidentiality"));
+        assert!(!profile.sysctl.is_empty());
+        assert!(!profile.boot.is_empty());
+    }
+
+    #[test]
+    fn baseline_fixture_values_pass_sysctl_validation() {
+        let path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("profiles/baseline.toml");
+        let profile = load_profile(&path).unwrap();
+        for entry in &profile.sysctl {
+            SysctlKey::new(&entry.key)
+                .unwrap_or_else(|e| panic!("baseline sysctl key {:?} failed: {e}", entry.key));
+            SysctlValue::new(&entry.value)
+                .unwrap_or_else(|e| panic!("baseline sysctl value {:?} failed: {e}", entry.value));
+        }
+    }
+
+    #[test]
+    fn baseline_fixture_boot_args_pass_validation() {
+        let path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("profiles/baseline.toml");
+        let profile = load_profile(&path).unwrap();
+        for entry in &profile.boot {
+            BootArg::new(&entry.arg)
+                .unwrap_or_else(|e| panic!("baseline boot arg {:?} failed: {e}", entry.arg));
+        }
+    }
+
+    fn assert_validation_field(err: Error, expected: &str) {
+        match err {
+            Error::Validation { field, .. } => assert_eq!(field, expected),
+            other => panic!("expected Validation on {expected}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_profile_rejects_invalid_profile_name() {
+        let dir = tempdir().unwrap();
+        let body = r#"
+schema_version = 1
+profile_name = "../escape"
+"#;
+        let path = write_profile(dir.path(), "bad.toml", body);
+        assert_validation_field(load_profile(&path).unwrap_err(), "profile_name");
+    }
+
+    #[test]
+    fn load_profile_rejects_unsupported_modules_mode() {
+        let dir = tempdir().unwrap();
+        let body = r#"
+schema_version = 1
+profile_name = "x"
+
+[modules]
+mode = "blocklist"
+"#;
+        let path = write_profile(dir.path(), "bad.toml", body);
+        assert_validation_field(load_profile(&path).unwrap_err(), "modules.mode");
+    }
+
+    #[test]
+    fn load_profile_rejects_invalid_module_name() {
+        let dir = tempdir().unwrap();
+        let body = r#"
+schema_version = 1
+profile_name = "x"
+
+[modules]
+block = ["usb storage"]
+"#;
+        let path = write_profile(dir.path(), "bad.toml", body);
+        assert_validation_field(load_profile(&path).unwrap_err(), "module_name");
+    }
+
+    #[test]
+    fn load_profile_rejects_invalid_sysctl_key() {
+        let dir = tempdir().unwrap();
+        let body = r#"
+schema_version = 1
+profile_name = "x"
+
+[[sysctl]]
+key = "Kernel.kptr_restrict"
+value = "2"
+"#;
+        let path = write_profile(dir.path(), "bad.toml", body);
+        assert_validation_field(load_profile(&path).unwrap_err(), "sysctl_key");
+    }
+
+    #[test]
+    fn load_profile_rejects_invalid_sysctl_value() {
+        let dir = tempdir().unwrap();
+        let body = r#"
+schema_version = 1
+profile_name = "x"
+
+[[sysctl]]
+key = "kernel.kptr_restrict"
+value = "bad;semi"
+"#;
+        let path = write_profile(dir.path(), "bad.toml", body);
+        assert_validation_field(load_profile(&path).unwrap_err(), "sysctl_value");
+    }
+
+    #[test]
+    fn load_profile_rejects_invalid_boot_arg() {
+        let dir = tempdir().unwrap();
+        let body = r#"
+schema_version = 1
+profile_name = "x"
+
+[[boot]]
+arg = "has space"
+"#;
+        let path = write_profile(dir.path(), "bad.toml", body);
+        assert_validation_field(load_profile(&path).unwrap_err(), "boot_arg");
+    }
+
+    #[test]
+    fn load_profile_rejects_unknown_lockdown_expect() {
+        let dir = tempdir().unwrap();
+        let body = r#"
+schema_version = 1
+profile_name = "x"
+
+[lockdown]
+expect = "paranoid"
+"#;
+        let path = write_profile(dir.path(), "bad.toml", body);
+        assert_validation_field(load_profile(&path).unwrap_err(), "lockdown.expect");
+    }
+
+    #[test]
+    fn validate_content_accepts_all_three_lockdown_postures() {
+        for posture in ["none", "integrity", "confidentiality"] {
+            let mut p = mk_profile(vec![], vec![], vec![]);
+            p.lockdown.expect = Some(posture.to_string());
+            p.validate_content().unwrap();
         }
     }
 }
