@@ -17,15 +17,7 @@ pub struct SnapshotSummary {
 // Require a kernel-module suffix: arbitrary filenames must not leak into policy.
 fn path_to_module_name(path: &str) -> Option<String> {
     let base = std::path::Path::new(path.trim()).file_name()?.to_str()?;
-    let stripped = base
-        .strip_suffix(".ko.zst")
-        .or_else(|| base.strip_suffix(".ko.xz"))
-        .or_else(|| base.strip_suffix(".ko.gz"))
-        .or_else(|| base.strip_suffix(".ko"))?;
-    if stripped.is_empty() {
-        return None;
-    }
-    Some(normalize_module(stripped))
+    super::names::strip_module_suffix(base).map(normalize_module)
 }
 
 fn parse_proc_modules(text: &str) -> Vec<String> {
