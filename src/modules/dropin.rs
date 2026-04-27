@@ -44,6 +44,17 @@ fn scan_module_dir(dir: &Path, out: &mut Vec<String>, is_root: bool) -> Result<(
     Ok(())
 }
 
+// Sort for order independence; keep duplicates so extra lines still drift.
+pub(super) fn payload_signature(payload: &str) -> Vec<String> {
+    let mut lines: Vec<String> = payload
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    lines.sort();
+    lines
+}
+
 pub fn generate_modprobe_dropin(
     effective: &[ModuleName],
     installed: &[String],
@@ -217,5 +228,19 @@ mod tests {
         let installed = vec!["ext4".to_string(), "vfat".to_string()];
         let out = generate_modprobe_dropin(&effective, &installed, "x");
         assert!(!out.lines().any(|l| l.starts_with("install ")));
+    }
+
+    #[test]
+    fn payload_signature_ignores_comments_and_blanks_and_is_order_independent() {
+        let a = "# header\n\ninstall vfat /bin/false\ninstall aes /bin/false\n";
+        let b = "install aes /bin/false\n\n# other comment\ninstall vfat /bin/false\n";
+        assert_eq!(payload_signature(a), payload_signature(b));
+    }
+
+    #[test]
+    fn payload_signature_preserves_duplicates() {
+        let a = "install vfat /bin/false\ninstall vfat /bin/false\n";
+        let b = "install vfat /bin/false\n";
+        assert_ne!(payload_signature(a), payload_signature(b));
     }
 }
