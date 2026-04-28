@@ -11,6 +11,7 @@ mod paths;
 mod policy;
 mod result;
 mod runtime;
+mod sysctl;
 
 use std::path::{Path, PathBuf};
 
