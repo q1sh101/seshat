@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum Domain {
     All,
@@ -323,6 +325,39 @@ fn refuse_extras(rest: &[String], label: &str) -> Result<(), String> {
     }
 }
 
+// Strict first-position --root. No env fallback; ambiguous smoke targets are worse than strict parse.
+pub fn parse_globals(args: &[String]) -> Result<(Option<PathBuf>, Vec<String>), String> {
+    if args.first().map(String::as_str) != Some("--root") {
+        return Ok((None, args.to_vec()));
+    }
+    let value = args
+        .get(1)
+        .ok_or_else(|| "--root requires a value".to_string())?;
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err("--root requires an absolute path".to_string());
+    }
+    if path == Path::new("/") {
+        return Err("--root may not be the filesystem root".to_string());
+    }
+    // Refuses to create arbitrary trees implicitly.
+    let meta = std::fs::metadata(&path)
+        .map_err(|_| format!("--root {} must be an existing directory", path.display()))?;
+    if !meta.is_dir() {
+        return Err(format!("--root {} must be a directory", path.display()));
+    }
+    // Canonicalize so symlinks and ".." cannot escape the filesystem-root guard above.
+    let canonical = std::fs::canonicalize(&path)
+        .map_err(|e| format!("--root {} could not be canonicalized: {e}", path.display()))?;
+    if canonical == Path::new("/") {
+        return Err(format!(
+            "--root {} canonicalizes to /; refusing filesystem-root scope",
+            path.display()
+        ));
+    }
+    Ok((Some(canonical), args[2..].to_vec()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,5 +580,95 @@ mod tests {
     #[test]
     fn profile_flag_without_value_is_rejected() {
         assert!(parse(&argv(&["plan", "--profile"])).is_err());
+    }
+
+    #[test]
+    fn parse_globals_returns_none_when_root_flag_absent() {
+        let (root, rest) = parse_globals(&argv(&["modules", "list"])).unwrap();
+        assert!(root.is_none());
+        assert_eq!(rest, argv(&["modules", "list"]));
+    }
+
+    #[test]
+    fn parse_globals_extracts_canonical_root_when_first_position_and_existing_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = argv(&["--root", tmp.path().to_str().unwrap(), "modules", "list"]);
+        let (root, rest) = parse_globals(&args).unwrap();
+        assert_eq!(root, Some(tmp.path().canonicalize().unwrap()));
+        assert_eq!(rest, argv(&["modules", "list"]));
+    }
+
+    #[test]
+    fn parse_globals_rejects_missing_value() {
+        let err = parse_globals(&argv(&["--root"])).unwrap_err();
+        assert!(err.contains("requires a value"));
+    }
+
+    #[test]
+    fn parse_globals_rejects_relative_path() {
+        let err = parse_globals(&argv(&["--root", "relative/path", "help"])).unwrap_err();
+        assert!(err.contains("absolute"));
+    }
+
+    #[test]
+    fn parse_globals_rejects_filesystem_root() {
+        let err = parse_globals(&argv(&["--root", "/", "help"])).unwrap_err();
+        assert!(err.contains("may not be the filesystem root"));
+    }
+
+    #[test]
+    fn parse_globals_rejects_missing_path() {
+        let parent = tempfile::tempdir().unwrap();
+        let missing = parent.path().join("does_not_exist");
+        let args = argv(&["--root", missing.to_str().unwrap(), "modules", "list"]);
+        let err = parse_globals(&args).unwrap_err();
+        assert!(err.contains("existing directory"), "err: {err}");
+    }
+
+    #[test]
+    fn parse_globals_rejects_regular_file_as_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("regular");
+        std::fs::write(&file, b"").unwrap();
+        let args = argv(&["--root", file.to_str().unwrap(), "modules", "list"]);
+        let err = parse_globals(&args).unwrap_err();
+        assert!(err.contains("directory"), "err: {err}");
+    }
+
+    #[test]
+    fn parse_globals_rejects_symlink_that_canonicalizes_to_filesystem_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("to-root");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        let args = argv(&["--root", link.to_str().unwrap(), "help"]);
+        let err = parse_globals(&args).unwrap_err();
+        assert!(err.contains("canonicalizes to /"), "err: {err}");
+    }
+
+    #[test]
+    fn parse_globals_rejects_parent_traversal_that_canonicalizes_to_filesystem_root() {
+        let args = argv(&["--root", "/tmp/..", "help"]);
+        let err = parse_globals(&args).unwrap_err();
+        assert!(err.contains("canonicalizes to /"), "err: {err}");
+    }
+
+    #[test]
+    fn parse_globals_accepts_symlink_to_regular_directory_returning_canonical_path() {
+        let real = tempfile::tempdir().unwrap();
+        let link_host = tempfile::tempdir().unwrap();
+        let link = link_host.path().join("to-real");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+        let args = argv(&["--root", link.to_str().unwrap(), "modules", "list"]);
+        let (root, _) = parse_globals(&args).unwrap();
+        assert_eq!(root, Some(real.path().canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn parse_globals_strict_first_position_ignores_midstream_root() {
+        // --root after a subcommand is NOT extracted; it stays in rest for the
+        // per-command parser to reject via its own "unknown argument" path.
+        let (root, rest) = parse_globals(&argv(&["modules", "list", "--root", "/tmp"])).unwrap();
+        assert!(root.is_none());
+        assert_eq!(rest, argv(&["modules", "list", "--root", "/tmp"]));
     }
 }

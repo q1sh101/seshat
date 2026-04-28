@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use crate::atomic::install_root_file;
 use crate::backup::create_backup;
 use crate::error::Error;
+use crate::paths::ensure_dir;
 use crate::policy::{ModuleName, normalize_module};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -123,6 +124,11 @@ where
     let (payload, summary) =
         gather_snapshot(proc_modules_path, modules_dir, kernel_release, resolve_deps)?;
 
+    // Lazy: parent dir created only after gather succeeds.
+    if let Some(parent) = dest.parent() {
+        ensure_dir(parent)?;
+    }
+
     // create_new enforces create-or-fail: exists -> AlreadyExists.
     let mut file = fs::OpenOptions::new()
         .write(true)
@@ -156,9 +162,14 @@ pub fn reset_snapshot<F>(
 where
     F: FnMut(&str) -> Option<Vec<String>>,
 {
-    let backup = create_backup(dest, backup_dir)?;
+    // Lazy: gather runs first so a failed read leaves neither backup_dir nor target parent behind.
     let (payload, summary) =
         gather_snapshot(proc_modules_path, modules_dir, kernel_release, resolve_deps)?;
+    ensure_dir(backup_dir)?;
+    let backup = create_backup(dest, backup_dir)?;
+    if let Some(parent) = dest.parent() {
+        ensure_dir(parent)?;
+    }
     install_root_file(dest, payload.as_bytes(), 0o600)?;
     Ok(ResetSummary {
         snapshot: summary,

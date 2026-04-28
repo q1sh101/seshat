@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use crate::atomic::install_root_file;
 use crate::backup::create_backup;
 use crate::error::Error;
+use crate::paths::ensure_dir;
 use crate::policy::{ModuleName, normalize_module, safe_policy_read};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -99,7 +100,9 @@ pub fn allow_module(
         });
     }
     let existing = read_validated_overlay(allow_path)?;
+    // Lazy: backup_dir only opened when a backup is actually staged.
     let backup = if existing.is_some() {
+        ensure_dir(backup_dir)?;
         create_backup(allow_path, backup_dir)?
     } else {
         None
@@ -108,12 +111,21 @@ pub fn allow_module(
         Some(t) => append_overlay(t, mod_name.as_str()),
         None => fresh_overlay("allow", mod_name.as_str()),
     };
+    ensure_write_parent(allow_path)?;
     install_root_file(allow_path, new_content.as_bytes(), 0o600)?;
     Ok(EditOutcome {
         changed: true,
         backup,
         overlap: false,
     })
+}
+
+// install_root_file uses tempfile_in(parent); lazy create at the write site only.
+fn ensure_write_parent(target: &Path) -> Result<(), Error> {
+    if let Some(parent) = target.parent() {
+        ensure_dir(parent)?;
+    }
+    Ok(())
 }
 
 pub fn unallow_module(
@@ -139,7 +151,9 @@ pub fn unallow_module(
             overlap: false,
         });
     }
+    ensure_dir(backup_dir)?;
     let backup = create_backup(allow_path, backup_dir)?;
+    ensure_write_parent(allow_path)?;
     install_root_file(allow_path, new_content.as_bytes(), 0o600)?;
     Ok(EditOutcome {
         changed: true,
@@ -164,6 +178,7 @@ pub fn block_module(
     }
     let existing = read_validated_overlay(block_path)?;
     let backup = if existing.is_some() {
+        ensure_dir(backup_dir)?;
         create_backup(block_path, backup_dir)?
     } else {
         None
@@ -172,6 +187,7 @@ pub fn block_module(
         Some(t) => append_overlay(t, mod_name.as_str()),
         None => fresh_overlay("block", mod_name.as_str()),
     };
+    ensure_write_parent(block_path)?;
     install_root_file(block_path, new_content.as_bytes(), 0o600)?;
     Ok(EditOutcome {
         changed: true,
@@ -203,7 +219,9 @@ pub fn unblock_module(
             overlap: false,
         });
     }
+    ensure_dir(backup_dir)?;
     let backup = create_backup(block_path, backup_dir)?;
+    ensure_write_parent(block_path)?;
     install_root_file(block_path, new_content.as_bytes(), 0o600)?;
     Ok(EditOutcome {
         changed: true,

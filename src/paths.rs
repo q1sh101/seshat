@@ -1,7 +1,33 @@
 use std::ffi::{OsStr, OsString};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::error::Error;
+
+// Symlinked write dirs leak primitive writes outside `<root>` (tempfile_in follows the symlink).
+pub fn ensure_dir(path: &Path) -> Result<(), Error> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            let ft = meta.file_type();
+            if ft.is_symlink() {
+                return Err(Error::UnsafePath {
+                    path: path.to_path_buf(),
+                    reason: "directory target is a symlink".to_string(),
+                });
+            }
+            if !ft.is_dir() {
+                return Err(Error::UnsafePath {
+                    path: path.to_path_buf(),
+                    reason: "path exists and is not a directory".to_string(),
+                });
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(path).map_err(Error::Io)
+        }
+        Err(e) => Err(Error::Io(e)),
+    }
+}
 
 const SESHAT_SUBDIR: &str = "seshat";
 const LOCK_SUBDIR: &str = "seshat-locks";
