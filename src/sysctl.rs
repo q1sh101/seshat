@@ -1,8 +1,10 @@
+mod deploy;
 mod dropin;
 mod plan;
 mod setting;
 mod verify;
 
+pub use deploy::{DeploySummary, ReloadStatus, deploy_sysctl, reload_sysctl};
 pub use dropin::generate_sysctl_dropin;
 pub use plan::{LiveRead, PlanRow, PlanState, SysctlPlan, plan_sysctl, read_live_sysctl};
 pub use setting::{SysctlSetting, normalize_sysctl_value};
