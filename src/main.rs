@@ -7,6 +7,7 @@ mod cli;
 mod error;
 mod lock;
 mod modules;
+mod orchestrator;
 mod output;
 mod paths;
 mod policy;
