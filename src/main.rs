@@ -2,6 +2,7 @@
 
 mod atomic;
 mod backup;
+mod boot;
 mod cli;
 mod error;
 mod lock;
