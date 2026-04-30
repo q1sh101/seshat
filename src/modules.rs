@@ -11,7 +11,7 @@ mod verify;
 
 pub use allowlist::{effective_allowlist, parse_allowlist};
 pub use deploy::{DeploySummary, deploy_enforcement};
-pub use dropin::{generate_modprobe_dropin, scan_installed_modules};
+pub use dropin::{generate_modprobe_dropin, payload_signature, scan_installed_modules};
 pub use list::{AllowlistReport, list_allowlist};
 pub use overlay::{EditOutcome, allow_module, block_module, unallow_module, unblock_module};
 pub use pending::{PendingReport, check_pending_modules};

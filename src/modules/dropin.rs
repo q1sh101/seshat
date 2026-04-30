@@ -45,7 +45,7 @@ fn scan_module_dir(dir: &Path, out: &mut Vec<String>, is_root: bool) -> Result<(
 }
 
 // Sort for order independence; keep duplicates so extra lines still drift.
-pub(super) fn payload_signature(payload: &str) -> Vec<String> {
+pub fn payload_signature(payload: &str) -> Vec<String> {
     let mut lines: Vec<String> = payload
         .lines()
         .map(|l| l.trim().to_string())
