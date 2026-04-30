@@ -9,7 +9,7 @@ pub use deploy::{
 };
 pub use plan::{PlanInputs, PlanReport, orchestrate_plan};
 pub use status::{
-    BootStatus, LockStatus, ModulesStatus, StatusInputs, StatusReport, SysctlStatus, fingerprint,
-    orchestrate_status,
+    BootStatus, DriftState, LockStatus, ModulesStatus, StatusInputs, StatusReport, SysctlStatus,
+    fingerprint, orchestrate_status,
 };
 pub use verify::{LockdownRow, VerifyInputs, VerifyReport, orchestrate_verify};

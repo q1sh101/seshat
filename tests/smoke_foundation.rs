@@ -58,9 +58,8 @@ fn unknown_top_level_command_exits_two_with_usage_on_stderr() {
 
 #[test]
 fn unwired_parsed_command_exits_one_with_not_implemented_on_stderr() {
-    // `plan` parses cleanly but the domain wiring into main does not exist
-    // at the foundation boundary; main dispatches unwired variants to exit 1.
-    let (code, _, stderr) = run(&["plan"]);
+    // `watch install` parses cleanly; service-unit domain is unwired through M1.
+    let (code, _, stderr) = run(&["watch", "install"]);
     assert_eq!(code, 1);
     assert!(stderr.contains("not implemented"));
 }
