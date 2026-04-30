@@ -8,7 +8,7 @@ use crate::policy::{ModuleName, Profile, SysctlKey};
 use crate::result::CheckState;
 use crate::sysctl::{self, DeploySummary as SysctlDeploy, LiveRead, ReloadStatus, SysctlSetting};
 
-const DEPLOY_LOCK_NAME: &str = "deploy";
+use super::OPERATION_LOCK_NAME;
 
 pub const BOOT_DEPLOY_REFUSED: &str =
     "boot deploy not implemented in this build; Milestone 2 covers GRUB deploy";
@@ -89,7 +89,7 @@ where
     F: FnOnce() -> ReloadStatus,
     G: FnMut(&SysctlKey) -> LiveRead,
 {
-    let _guard = lock::acquire(inputs.lock_root, DEPLOY_LOCK_NAME)?;
+    let _guard = lock::acquire(inputs.lock_root, OPERATION_LOCK_NAME)?;
     Ok(DeployReport {
         sysctl: deploy_sysctl_domain(inputs, sysctl_reload, sysctl_read_live),
         modules: deploy_modules_domain(inputs),
@@ -445,7 +445,7 @@ mod tests {
     fn deploy_fails_when_another_deploy_holds_the_lock() {
         let env = env();
         let prof = profile(vec![("kernel.kptr_restrict", "2")], vec![], vec![]);
-        let _holder = lock::acquire(&env.lock_root, DEPLOY_LOCK_NAME).unwrap();
+        let _holder = lock::acquire(&env.lock_root, OPERATION_LOCK_NAME).unwrap();
         let result = orchestrate_deploy(
             &inputs(&env, &prof),
             || ReloadStatus::Applied,
@@ -520,7 +520,7 @@ mod tests {
     fn exit_code_three_on_top_level_lock_contention() {
         let env = env();
         let prof = profile(vec![("kernel.kptr_restrict", "2")], vec![], vec![]);
-        let _holder = lock::acquire(&env.lock_root, DEPLOY_LOCK_NAME).unwrap();
+        let _holder = lock::acquire(&env.lock_root, OPERATION_LOCK_NAME).unwrap();
         let err = orchestrate_deploy(
             &inputs(&env, &prof),
             || ReloadStatus::Applied,
