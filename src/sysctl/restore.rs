@@ -1,11 +1,9 @@
-use std::ffi::OsStr;
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 
 use super::deploy::ReloadStatus;
 use crate::atomic::install_root_file;
-use crate::backup::BACKUP_SUFFIX;
+use crate::backup::latest_backup_for;
 use crate::error::Error;
 
 const SYSCTL_DROPIN_MODE: u32 = 0o644;
@@ -59,47 +57,10 @@ where
     })
 }
 
-fn latest_backup_for(basename: &OsStr, backup_dir: &Path) -> Result<Option<PathBuf>, Error> {
-    let entries = match fs::read_dir(backup_dir) {
-        Ok(it) => it,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(Error::Io(e)),
-    };
-
-    let mut best: Option<((u64, u32, u32), PathBuf)> = None;
-    for entry in entries {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(ts) = parse_backup_suffix(basename, &name) else {
-            continue;
-        };
-        let candidate = entry.path();
-        let better = best.as_ref().is_none_or(|(bts, _)| ts > *bts);
-        if better {
-            best = Some((ts, candidate));
-        }
-    }
-    Ok(best.map(|(_, path)| path))
-}
-
-// Canonical layout from backup::create_backup: "<basename>.<secs>.<nanos9>.<pid>.bak".
-fn parse_backup_suffix(basename: &OsStr, name: &OsStr) -> Option<(u64, u32, u32)> {
-    let full = name.to_str()?;
-    let base = basename.to_str()?;
-    let tail = full.strip_prefix(base)?.strip_prefix('.')?;
-    let core = tail.strip_suffix(BACKUP_SUFFIX)?.strip_suffix('.')?;
-    let mut parts = core.rsplitn(3, '.');
-    let pid = parts.next()?.parse::<u32>().ok()?;
-    let nanos = parts.next()?.parse::<u32>().ok()?;
-    let secs = parts.next()?.parse::<u64>().ok()?;
-    Some((secs, nanos, pid))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::backup::create_backup;
-    use std::fs;
     use std::os::unix::fs::symlink;
     use tempfile::tempdir;
 
@@ -327,32 +288,5 @@ mod tests {
         fs::remove_file(&target).ok();
         symlink(&elsewhere, &target).unwrap();
         let _ = restore_sysctl_from_backup(&target, &backup_dir, never_reload).unwrap_err();
-    }
-
-    #[test]
-    fn parse_backup_suffix_rejects_nonnumeric_components() {
-        let ts = parse_backup_suffix(OsStr::new("99.conf"), OsStr::new("99.conf.abc.def.ghi.bak"));
-        assert!(ts.is_none());
-    }
-
-    #[test]
-    fn parse_backup_suffix_rejects_wrong_extension() {
-        let ts = parse_backup_suffix(OsStr::new("99.conf"), OsStr::new("99.conf.10.20.30.tar"));
-        assert!(ts.is_none());
-    }
-
-    #[test]
-    fn parse_backup_suffix_rejects_basename_mismatch() {
-        let ts = parse_backup_suffix(OsStr::new("99.conf"), OsStr::new("other.conf.10.20.30.bak"));
-        assert!(ts.is_none());
-    }
-
-    #[test]
-    fn parse_backup_suffix_accepts_canonical_format() {
-        let ts = parse_backup_suffix(
-            OsStr::new("99-test.conf"),
-            OsStr::new("99-test.conf.1700000000.000000123.42.bak"),
-        );
-        assert_eq!(ts, Some((1_700_000_000u64, 123u32, 42u32)));
     }
 }

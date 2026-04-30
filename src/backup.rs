@@ -85,6 +85,45 @@ pub fn create_backup(destination: &Path, backup_dir: &Path) -> Result<Option<Pat
     create_backup_with_clock(destination, backup_dir, secs, nanos, std::process::id())
 }
 
+pub fn latest_backup_for(
+    basename: &OsStr,
+    backup_dir: &Path,
+) -> Result<Option<PathBuf>, Error> {
+    let entries = match fs::read_dir(backup_dir) {
+        Ok(it) => it,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Error::Io(e)),
+    };
+
+    let mut best: Option<((u64, u32, u32), PathBuf)> = None;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(ts) = parse_backup_suffix(basename, &name) else {
+            continue;
+        };
+        let candidate = entry.path();
+        let better = best.as_ref().is_none_or(|(bts, _)| ts > *bts);
+        if better {
+            best = Some((ts, candidate));
+        }
+    }
+    Ok(best.map(|(_, path)| path))
+}
+
+// Canonical layout from create_backup: "<basename>.<secs>.<nanos9>.<pid>.bak".
+fn parse_backup_suffix(basename: &OsStr, name: &OsStr) -> Option<(u64, u32, u32)> {
+    let full = name.to_str()?;
+    let base = basename.to_str()?;
+    let tail = full.strip_prefix(base)?.strip_prefix('.')?;
+    let core = tail.strip_suffix(BACKUP_SUFFIX)?.strip_suffix('.')?;
+    let mut parts = core.rsplitn(3, '.');
+    let pid = parts.next()?.parse::<u32>().ok()?;
+    let nanos = parts.next()?.parse::<u32>().ok()?;
+    let secs = parts.next()?.parse::<u64>().ok()?;
+    Some((secs, nanos, pid))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,5 +304,95 @@ mod tests {
         assert_eq!(read_file(&backup), b"payload");
         assert_eq!(backup.parent().unwrap(), backup_dir);
         assert_eq!(backup.extension().and_then(|e| e.to_str()), Some("bak"));
+    }
+
+    fn seed(backup_dir: &Path, basename: &str, secs: u64, nanos: u32, pid: u32) -> PathBuf {
+        let name = format!("{basename}.{secs}.{nanos:09}.{pid}.bak");
+        let path = backup_dir.join(name);
+        fs::write(&path, b"x").unwrap();
+        path
+    }
+
+    #[test]
+    fn parse_backup_suffix_accepts_canonical_format() {
+        let ts = parse_backup_suffix(
+            OsStr::new("99-test.conf"),
+            OsStr::new("99-test.conf.1700000000.000000123.42.bak"),
+        );
+        assert_eq!(ts, Some((1_700_000_000u64, 123u32, 42u32)));
+    }
+
+    #[test]
+    fn parse_backup_suffix_rejects_wrong_extension() {
+        let ts = parse_backup_suffix(OsStr::new("99.conf"), OsStr::new("99.conf.10.20.30.tar"));
+        assert!(ts.is_none());
+    }
+
+    #[test]
+    fn parse_backup_suffix_rejects_basename_mismatch() {
+        let ts = parse_backup_suffix(OsStr::new("99.conf"), OsStr::new("other.conf.10.20.30.bak"));
+        assert!(ts.is_none());
+    }
+
+    #[test]
+    fn parse_backup_suffix_rejects_nonnumeric_components() {
+        let ts = parse_backup_suffix(OsStr::new("99.conf"), OsStr::new("99.conf.abc.def.ghi.bak"));
+        assert!(ts.is_none());
+    }
+
+    #[test]
+    fn latest_backup_returns_none_when_dir_missing() {
+        let state = tempdir().unwrap();
+        let backup_dir = state.path().join("never");
+        let out = latest_backup_for(OsStr::new("99.conf"), &backup_dir).unwrap();
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn latest_backup_returns_none_when_dir_empty() {
+        let state = tempdir().unwrap();
+        let backup_dir = state.path().join("backups");
+        fs::create_dir_all(&backup_dir).unwrap();
+        let out = latest_backup_for(OsStr::new("99.conf"), &backup_dir).unwrap();
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn latest_backup_picks_highest_timestamp_tuple() {
+        let state = tempdir().unwrap();
+        let backup_dir = state.path().join("backups");
+        fs::create_dir_all(&backup_dir).unwrap();
+        seed(&backup_dir, "99.conf", 10, 1, 1);
+        seed(&backup_dir, "99.conf", 20, 0, 1);
+        let winner = seed(&backup_dir, "99.conf", 20, 500, 1);
+        let out = latest_backup_for(OsStr::new("99.conf"), &backup_dir)
+            .unwrap()
+            .unwrap();
+        assert_eq!(out, winner);
+    }
+
+    #[test]
+    fn latest_backup_tie_broken_by_higher_pid() {
+        let state = tempdir().unwrap();
+        let backup_dir = state.path().join("backups");
+        fs::create_dir_all(&backup_dir).unwrap();
+        seed(&backup_dir, "99.conf", 10, 20, 100);
+        let winner = seed(&backup_dir, "99.conf", 10, 20, 999);
+        let out = latest_backup_for(OsStr::new("99.conf"), &backup_dir)
+            .unwrap()
+            .unwrap();
+        assert_eq!(out, winner);
+    }
+
+    #[test]
+    fn latest_backup_ignores_other_basenames_and_noncanonical_files() {
+        let state = tempdir().unwrap();
+        let backup_dir = state.path().join("backups");
+        fs::create_dir_all(&backup_dir).unwrap();
+        seed(&backup_dir, "other.conf", 99, 99, 99);
+        fs::write(backup_dir.join("README"), b"unrelated").unwrap();
+        fs::write(backup_dir.join("99.conf.bak"), b"no-ts").unwrap();
+        let out = latest_backup_for(OsStr::new("99.conf"), &backup_dir).unwrap();
+        assert!(out.is_none());
     }
 }
