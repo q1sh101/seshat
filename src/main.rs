@@ -24,10 +24,10 @@ use cli::{Command, Domain, ModulesCmd, SnapshotCmd};
 use error::Error;
 use modules::{ModulesLockOutcome, ModulesRestore, PendingReport};
 use orchestrator::{
-    BOOT_DEPLOY_REFUSED, BOOT_ROLLBACK_REFUSED, DeployInputs, LockInputs, LockReport, PlanInputs,
-    RollbackDomain, RollbackInputs, RollbackOutcome, StatusInputs, VerifyInputs,
-    classify_deploy_error, orchestrate_deploy, orchestrate_lock, orchestrate_plan,
-    orchestrate_rollback, orchestrate_status, orchestrate_verify,
+    BOOT_ROLLBACK_REFUSED, DeployInputs, LockInputs, LockReport, PlanInputs, RollbackDomain,
+    RollbackInputs, RollbackOutcome, StatusInputs, VerifyInputs, classify_deploy_error,
+    orchestrate_deploy, orchestrate_lock, orchestrate_plan, orchestrate_rollback,
+    orchestrate_status, orchestrate_verify,
 };
 use paths::ensure_dir;
 use policy::{ModuleName, Profile, ProfileName};
@@ -381,10 +381,6 @@ fn dispatch_status(profile: Option<String>, domain: Domain, root: Option<&Path>)
 }
 
 fn dispatch_deploy(profile: Option<String>, domain: Domain, root: Option<&Path>) -> i32 {
-    if matches!(domain, Domain::Boot) {
-        output::fail(BOOT_DEPLOY_REFUSED);
-        return 3;
-    }
     let prof = match load_profile(root, profile.as_deref()) {
         Ok(p) => p,
         Err(e) => return print_error_exit(&e, 1),
@@ -397,8 +393,8 @@ fn dispatch_deploy(profile: Option<String>, domain: Domain, root: Option<&Path>)
     match domain {
         Domain::Sysctl => deploy_sysctl_only(&prof, &paths, root),
         Domain::Modules => deploy_modules_only(&prof, &paths),
+        Domain::Boot => deploy_boot_only(&prof, &paths, root),
         Domain::All => deploy_all(&prof, &paths, root),
-        Domain::Boot => unreachable!("handled above"),
     }
 }
 
@@ -505,9 +501,78 @@ fn deploy_modules_only(profile: &Profile, paths: &CliPaths) -> i32 {
     }
 }
 
+fn deploy_boot_only(profile: &Profile, paths: &CliPaths, root: Option<&Path>) -> i32 {
+    // Per-domain dir setup: only boot tree is touched; sysctl/modules/lock untouched.
+    if let Err(e) = ensure_dir(&paths.boot_backup_dir) {
+        return print_error_exit(&e, 1);
+    }
+    if let Err(e) = refuse_unsafe_dir_if_exists(&paths.grub_config_d) {
+        return print_error_exit(&e, 1);
+    }
+    if let Some(parent) = paths.grub_config.parent()
+        && let Err(e) = refuse_unsafe_dir_if_exists(parent)
+    {
+        return print_error_exit(&e, 1);
+    }
+    let inputs = DeployInputs {
+        profile,
+        modules_dir: &paths.modules_dir,
+        snapshot_path: &paths.snapshot_path,
+        allow_path: &paths.allow_path,
+        block_path: &paths.block_path,
+        sysctl_target: &paths.sysctl_target,
+        sysctl_backup_dir: &paths.sysctl_backup_dir,
+        modprobe_target: &paths.modprobe_target,
+        modprobe_backup_dir: &paths.modules_backup_dir,
+        lock_root: &paths.lock_root,
+        grub_config: &paths.grub_config,
+        grub_config_d: &paths.grub_config_d,
+        grub_cfg: &paths.grub_cfg,
+        grub_dropin_target: &paths.grub_dropin_target,
+        kernel_cmdline: &paths.kernel_cmdline,
+        boot_backup_dir: &paths.boot_backup_dir,
+    };
+    let has_command = has_command_probe(root);
+    let runner = boot_runner_closure(root);
+    let status = orchestrator::deploy_boot_domain(&inputs, has_command, runner);
+    render_boot_status(&status)
+}
+
+fn render_boot_status(status: &orchestrator::BootDeployStatus) -> i32 {
+    match status {
+        orchestrator::BootDeployStatus::Applied(summary) => {
+            let reboot = if summary.refresh.reboot_required() {
+                " [reboot required]"
+            } else {
+                ""
+            };
+            output::ok(&format!(
+                "deploy boot: {:?} -> {} refresh={:?}{}",
+                summary.mode,
+                summary.target.display(),
+                summary.refresh,
+                reboot
+            ));
+            0
+        }
+        orchestrator::BootDeployStatus::Skipped(reason) => {
+            output::log(&format!("deploy boot: {}", reason.message()));
+            0
+        }
+        orchestrator::BootDeployStatus::DomainError(e) => {
+            output::fail(&format!("deploy boot: {e}"));
+            1
+        }
+    }
+}
+
 fn deploy_all(profile: &Profile, paths: &CliPaths, root: Option<&Path>) -> i32 {
     // All-domain setup: orchestrator takes lock::acquire so lock_root must exist at exactly 0700.
-    for dir in [&paths.sysctl_backup_dir, &paths.modules_backup_dir] {
+    for dir in [
+        &paths.sysctl_backup_dir,
+        &paths.modules_backup_dir,
+        &paths.boot_backup_dir,
+    ] {
         if let Err(e) = ensure_dir(dir) {
             return print_error_exit(&e, 1);
         }
@@ -525,6 +590,15 @@ fn deploy_all(profile: &Profile, paths: &CliPaths, root: Option<&Path>) -> i32 {
     {
         return print_error_exit(&e, 1);
     }
+    // Refuse-only (no auto-create) so backend detection's drop-in availability signal stays operator-driven.
+    if let Err(e) = refuse_unsafe_dir_if_exists(&paths.grub_config_d) {
+        return print_error_exit(&e, 1);
+    }
+    if let Some(parent) = paths.grub_config.parent()
+        && let Err(e) = refuse_unsafe_dir_if_exists(parent)
+    {
+        return print_error_exit(&e, 1);
+    }
     let inputs = DeployInputs {
         profile,
         modules_dir: &paths.modules_dir,
@@ -536,10 +610,18 @@ fn deploy_all(profile: &Profile, paths: &CliPaths, root: Option<&Path>) -> i32 {
         modprobe_target: &paths.modprobe_target,
         modprobe_backup_dir: &paths.modules_backup_dir,
         lock_root: &paths.lock_root,
+        grub_config: &paths.grub_config,
+        grub_config_d: &paths.grub_config_d,
+        grub_cfg: &paths.grub_cfg,
+        grub_dropin_target: &paths.grub_dropin_target,
+        kernel_cmdline: &paths.kernel_cmdline,
+        boot_backup_dir: &paths.boot_backup_dir,
     };
     let reload = sysctl_reload_closure(root);
     let read_live = sysctl_read_live_closure(&paths.proc_sys_root);
-    let result = orchestrate_deploy(&inputs, reload, read_live);
+    let has_command = has_command_probe(root);
+    let boot_runner = boot_runner_closure(root);
+    let result = orchestrate_deploy(&inputs, reload, read_live, has_command, boot_runner);
     render_deploy_report(&result)
 }
 
@@ -549,6 +631,22 @@ fn sysctl_reload_closure(root: Option<&Path>) -> Box<dyn FnOnce() -> ReloadStatu
         Box::new(|| ReloadStatus::Applied)
     } else {
         Box::new(sysctl::reload_sysctl)
+    }
+}
+
+type BootRunner =
+    Box<dyn FnOnce(&str, Vec<&std::ffi::OsStr>) -> Result<runtime::CommandOutput, Error>>;
+
+// Under --root pretend grub refresh tool is unavailable so no external command runs in smoke; production uses sanitized PATH.
+fn boot_runner_closure(root: Option<&Path>) -> BootRunner {
+    if root.is_some() {
+        Box::new(|_, _| {
+            Err(Error::Io(std::io::Error::from(
+                std::io::ErrorKind::NotFound,
+            )))
+        })
+    } else {
+        Box::new(|program, args| runtime::run_sanitized(program, args))
     }
 }
 
@@ -877,7 +975,28 @@ fn render_deploy_report(result: &Result<orchestrator::DeployReport, Error>) -> i
                 )),
                 Err(e) => output::fail(&format!("deploy modules: {e}")),
             }
-            output::log(&format!("deploy boot: {}", report.boot.reason));
+            match &report.boot {
+                orchestrator::BootDeployStatus::Applied(summary) => {
+                    let reboot = if summary.refresh.reboot_required() {
+                        " [reboot required]"
+                    } else {
+                        ""
+                    };
+                    output::ok(&format!(
+                        "deploy boot: {:?} -> {} refresh={:?}{}",
+                        summary.mode,
+                        summary.target.display(),
+                        summary.refresh,
+                        reboot
+                    ));
+                }
+                orchestrator::BootDeployStatus::Skipped(reason) => {
+                    output::log(&format!("deploy boot: {}", reason.message()));
+                }
+                orchestrator::BootDeployStatus::DomainError(e) => {
+                    output::fail(&format!("deploy boot: {e}"));
+                }
+            }
             report.exit_code()
         }
         Err(e) => {
@@ -1200,12 +1319,14 @@ struct CliPaths {
     grub_config: PathBuf,
     grub_config_d: PathBuf,
     grub_cfg: PathBuf,
+    grub_dropin_target: PathBuf,
     kernel_cmdline: PathBuf,
     sys_lockdown: PathBuf,
     modules_dir: PathBuf,
     kernel_release: String,
     modules_disabled: PathBuf,
     lock_root: PathBuf,
+    boot_backup_dir: PathBuf,
 }
 
 fn cli_paths(root: Option<&Path>) -> Result<CliPaths, Error> {
@@ -1216,6 +1337,7 @@ fn cli_paths(root: Option<&Path>) -> Result<CliPaths, Error> {
     let profiles_dir = state_root.join(PROFILES_SUBDIR);
     let modules_backup_dir = profiles_dir.join(format!("{BACKUPS_SUBDIR}-modprobe"));
     let sysctl_backup_dir = profiles_dir.join(format!("{BACKUPS_SUBDIR}-sysctl"));
+    let boot_backup_dir = profiles_dir.join(format!("{BACKUPS_SUBDIR}-boot"));
 
     let (kernel_release, modules_dir, proc_modules_path) = match root {
         Some(r) => (
@@ -1238,6 +1360,7 @@ fn cli_paths(root: Option<&Path>) -> Result<CliPaths, Error> {
         grub_config,
         grub_config_d,
         grub_cfg,
+        grub_dropin_target,
         kernel_cmdline,
         sys_lockdown,
         modules_disabled,
@@ -1251,6 +1374,7 @@ fn cli_paths(root: Option<&Path>) -> Result<CliPaths, Error> {
             r.join("etc/default/grub"),
             r.join("etc/default/grub.d"),
             r.join("boot/grub/grub.cfg"),
+            r.join("etc/default/grub.d/99-kernel-hardening.cfg"),
             r.join("etc/kernel/cmdline"),
             r.join("sys/kernel/security/lockdown"),
             r.join("proc/sys/kernel/modules_disabled"),
@@ -1264,6 +1388,7 @@ fn cli_paths(root: Option<&Path>) -> Result<CliPaths, Error> {
             PathBuf::from(paths::GRUB_CONFIG),
             PathBuf::from("/etc/default/grub.d"),
             PathBuf::from(paths::GRUB_CFG),
+            PathBuf::from(paths::GRUB_DROPIN),
             PathBuf::from(paths::KERNEL_CMDLINE),
             PathBuf::from(paths::SYS_LOCKDOWN),
             PathBuf::from(paths::PROC_MODULES_DISABLED),
@@ -1292,12 +1417,14 @@ fn cli_paths(root: Option<&Path>) -> Result<CliPaths, Error> {
         grub_config,
         grub_config_d,
         grub_cfg,
+        grub_dropin_target,
         kernel_cmdline,
         sys_lockdown,
         modules_dir,
         kernel_release,
         modules_disabled,
         lock_root,
+        boot_backup_dir,
     })
 }
 
@@ -1321,6 +1448,30 @@ fn read_uname_release() -> Result<String, Error> {
         });
     }
     Ok(rel)
+}
+
+// Operator-owned grub dirs must not be auto-created (would flip backend mode); refuse symlink/non-dir only.
+fn refuse_unsafe_dir_if_exists(path: &Path) -> Result<(), Error> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            let ft = meta.file_type();
+            if ft.is_symlink() {
+                return Err(Error::UnsafePath {
+                    path: path.to_path_buf(),
+                    reason: "directory target is a symlink".to_string(),
+                });
+            }
+            if !ft.is_dir() {
+                return Err(Error::UnsafePath {
+                    path: path.to_path_buf(),
+                    reason: "path exists and is not a directory".to_string(),
+                });
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::Io(e)),
+    }
 }
 
 // lock::acquire requires exact mode 0o700; umask 022 would default to 0o755.

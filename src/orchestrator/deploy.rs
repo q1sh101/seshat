@@ -1,21 +1,58 @@
+use std::ffi::OsStr;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use crate::boot::{
+    self, Backend, RefreshStatus, deploy_grub_dropin, deploy_grub_main_config,
+    parse_grub_cmdline_default, plan_boot_params, refresh_grub_configuration,
+};
 use crate::error::Error;
 use crate::lock;
 use crate::modules::{self, DeploySummary as ModulesDeploy};
-use crate::policy::{ModuleName, Profile, SysctlKey};
+use crate::policy::{BootArg, ModuleName, Profile, SysctlKey};
 use crate::result::CheckState;
+use crate::runtime::CommandOutput;
 use crate::sysctl::{self, DeploySummary as SysctlDeploy, LiveRead, ReloadStatus, SysctlSetting};
 
 use super::OPERATION_LOCK_NAME;
 
-pub const BOOT_DEPLOY_REFUSED: &str =
-    "boot deploy not implemented in this build; Milestone 2 covers GRUB deploy";
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum BootDeployMode {
+    GrubDropIn,
+    GrubMainFile,
+}
 
-#[derive(Debug, PartialEq, Eq)]
-pub struct BootDeployStatus {
-    pub reason: &'static str,
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum BootSkipReason {
+    NoProfileBootArgs,
+    BackendSystemdBoot,
+    BackendUnknown,
+    GrubFilesMissing,
+}
+
+impl BootSkipReason {
+    pub fn message(&self) -> &'static str {
+        match self {
+            Self::NoProfileBootArgs => "boot deploy: profile has no boot args",
+            Self::BackendSystemdBoot => "boot deploy: systemd-boot backend not supported",
+            Self::BackendUnknown => "boot deploy: no known bootloader detected",
+            Self::GrubFilesMissing => "boot deploy: /etc/default/grub(.d) not present",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct BootDeploySummary {
+    pub mode: BootDeployMode,
+    pub target: PathBuf,
+    pub refresh: RefreshStatus,
+}
+
+#[derive(Debug)]
+pub enum BootDeployStatus {
+    Applied(BootDeploySummary),
+    Skipped(BootSkipReason),
+    DomainError(Error),
 }
 
 #[derive(Debug)]
@@ -37,7 +74,8 @@ impl DeployReport {
             .err()
             .map(classify_deploy_error)
             .unwrap_or(0);
-        sysctl_code.max(modules_code)
+        let boot_code = classify_boot_status(&self.boot);
+        sysctl_code.max(modules_code).max(boot_code)
     }
 }
 
@@ -67,6 +105,17 @@ fn classify_sysctl_summary(summary: &SysctlDeploy) -> i32 {
     }
 }
 
+fn classify_boot_status(status: &BootDeployStatus) -> i32 {
+    match status {
+        BootDeployStatus::Skipped(_) => 0,
+        BootDeployStatus::DomainError(e) => classify_deploy_error(e),
+        BootDeployStatus::Applied(summary) => match &summary.refresh {
+            RefreshStatus::Applied { .. } => 0,
+            RefreshStatus::Unavailable | RefreshStatus::Failed { .. } => 1,
+        },
+    }
+}
+
 pub struct DeployInputs<'a> {
     pub profile: &'a Profile,
     pub modules_dir: &'a Path,
@@ -78,24 +127,32 @@ pub struct DeployInputs<'a> {
     pub modprobe_target: &'a Path,
     pub modprobe_backup_dir: &'a Path,
     pub lock_root: &'a Path,
+    pub grub_config: &'a Path,
+    pub grub_config_d: &'a Path,
+    pub grub_cfg: &'a Path,
+    pub grub_dropin_target: &'a Path,
+    pub kernel_cmdline: &'a Path,
+    pub boot_backup_dir: &'a Path,
 }
 
-pub fn orchestrate_deploy<F, G>(
+pub fn orchestrate_deploy<F, G, H, R>(
     inputs: &DeployInputs<'_>,
     sysctl_reload: F,
     sysctl_read_live: G,
+    boot_has_command: H,
+    boot_runner: R,
 ) -> Result<DeployReport, Error>
 where
     F: FnOnce() -> ReloadStatus,
     G: FnMut(&SysctlKey) -> LiveRead,
+    H: Fn(&str) -> bool,
+    R: FnOnce(&str, Vec<&OsStr>) -> Result<CommandOutput, Error>,
 {
     let _guard = lock::acquire(inputs.lock_root, OPERATION_LOCK_NAME)?;
     Ok(DeployReport {
         sysctl: deploy_sysctl_domain(inputs, sysctl_reload, sysctl_read_live),
         modules: deploy_modules_domain(inputs),
-        boot: BootDeployStatus {
-            reason: BOOT_DEPLOY_REFUSED,
-        },
+        boot: deploy_boot_domain(inputs, boot_has_command, boot_runner),
     })
 }
 
@@ -157,6 +214,99 @@ fn deploy_modules_domain(inputs: &DeployInputs<'_>) -> Result<ModulesDeploy, Err
     )
 }
 
+// Skip reasons (empty profile, non-grub backend, missing grub files) exit cleanly; domain errors keep the existing exit-3 / exit-1 mapping.
+pub(crate) fn deploy_boot_domain<H, R>(
+    inputs: &DeployInputs<'_>,
+    has_command: H,
+    runner: R,
+) -> BootDeployStatus
+where
+    H: Fn(&str) -> bool,
+    R: FnOnce(&str, Vec<&OsStr>) -> Result<CommandOutput, Error>,
+{
+    if inputs.profile.boot.is_empty() {
+        return BootDeployStatus::Skipped(BootSkipReason::NoProfileBootArgs);
+    }
+
+    let backend = boot::detect_backend(
+        inputs.grub_config,
+        inputs.grub_config_d,
+        inputs.grub_cfg,
+        inputs.kernel_cmdline,
+        &has_command,
+    );
+    match backend {
+        Backend::SystemdBoot => {
+            return BootDeployStatus::Skipped(BootSkipReason::BackendSystemdBoot);
+        }
+        Backend::Unknown => return BootDeployStatus::Skipped(BootSkipReason::BackendUnknown),
+        Backend::Grub => {}
+    }
+
+    let has_dropin_parent = inputs.grub_config_d.is_dir();
+    let has_main = inputs.grub_config.is_file();
+    if !has_dropin_parent && !has_main {
+        return BootDeployStatus::Skipped(BootSkipReason::GrubFilesMissing);
+    }
+
+    let expected_args: Vec<BootArg> = match inputs
+        .profile
+        .boot
+        .iter()
+        .map(|e| BootArg::new(&e.arg))
+        .collect::<Result<_, _>>()
+    {
+        Ok(v) => v,
+        Err(e) => return BootDeployStatus::DomainError(e),
+    };
+
+    // Empty content on missing /etc/default/grub keeps plan sane; drop-in path still benefits from that current view.
+    let current_content = match std::fs::read_to_string(inputs.grub_config) {
+        Ok(c) => c,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return BootDeployStatus::DomainError(Error::Io(e)),
+    };
+    let current_default = match parse_grub_cmdline_default(&current_content) {
+        Ok(d) => d,
+        Err(e) => return BootDeployStatus::DomainError(e),
+    };
+    let current_cmdline = current_default.as_ref().map(|d| d.value.as_str());
+    let plan = plan_boot_params(current_cmdline, &expected_args);
+
+    let (deploy_result, mode) = if has_dropin_parent {
+        (
+            deploy_grub_dropin(
+                &plan.merged_cmdline,
+                inputs.profile.profile_name.as_str(),
+                inputs.grub_dropin_target,
+                inputs.boot_backup_dir,
+            ),
+            BootDeployMode::GrubDropIn,
+        )
+    } else {
+        (
+            deploy_grub_main_config(
+                &plan.merged_cmdline,
+                inputs.grub_config,
+                inputs.boot_backup_dir,
+            ),
+            BootDeployMode::GrubMainFile,
+        )
+    };
+    let summary = match deploy_result {
+        Ok(s) => s,
+        Err(e) => return BootDeployStatus::DomainError(e),
+    };
+
+    let refresh = refresh_grub_configuration(inputs.grub_cfg, &has_command, runner);
+
+    BootDeployStatus::Applied(BootDeploySummary {
+        mode,
+        target: summary.target,
+        refresh,
+    })
+}
+
 fn read_optional_allowlist(path: &Path) -> Result<Option<Vec<ModuleName>>, Error> {
     match modules::parse_allowlist(path) {
         Ok(v) => Ok(Some(v)),
@@ -168,6 +318,7 @@ fn read_optional_allowlist(path: &Path) -> Result<Option<Vec<ModuleName>>, Error
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::boot::RefreshBackend;
     use crate::policy::{BootEntry, LockdownSection, ModulesSection, SysctlEntry};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -185,6 +336,12 @@ mod tests {
         modprobe_target: PathBuf,
         modprobe_backup_dir: PathBuf,
         lock_root: PathBuf,
+        grub_config: PathBuf,
+        grub_config_d: PathBuf,
+        grub_cfg: PathBuf,
+        grub_dropin_target: PathBuf,
+        kernel_cmdline: PathBuf,
+        boot_backup_dir: PathBuf,
     }
 
     fn env() -> Env {
@@ -198,6 +355,12 @@ mod tests {
         let modprobe_target = root.path().join("modprobe.d/99-test.conf");
         let modprobe_backup_dir = root.path().join("backups/modules");
         let lock_root = root.path().join("locks");
+        let grub_config = root.path().join("etc/default/grub");
+        let grub_config_d = root.path().join("etc/default/grub.d");
+        let grub_cfg = root.path().join("boot/grub/grub.cfg");
+        let grub_dropin_target = grub_config_d.join("99-test.cfg");
+        let kernel_cmdline = root.path().join("etc/kernel/cmdline");
+        let boot_backup_dir = root.path().join("backups/boot");
         fs::create_dir_all(&modules_dir).unwrap();
         fs::create_dir_all(sysctl_target.parent().unwrap()).unwrap();
         fs::create_dir_all(&sysctl_backup_dir).unwrap();
@@ -205,6 +368,9 @@ mod tests {
         fs::create_dir_all(&modprobe_backup_dir).unwrap();
         fs::create_dir_all(&lock_root).unwrap();
         fs::set_permissions(&lock_root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir_all(grub_config.parent().unwrap()).unwrap();
+        fs::create_dir_all(grub_cfg.parent().unwrap()).unwrap();
+        fs::create_dir_all(&boot_backup_dir).unwrap();
         Env {
             _root: root,
             modules_dir,
@@ -216,6 +382,12 @@ mod tests {
             modprobe_target,
             modprobe_backup_dir,
             lock_root,
+            grub_config,
+            grub_config_d,
+            grub_cfg,
+            grub_dropin_target,
+            kernel_cmdline,
+            boot_backup_dir,
         }
     }
 
@@ -231,6 +403,12 @@ mod tests {
             modprobe_target: &env.modprobe_target,
             modprobe_backup_dir: &env.modprobe_backup_dir,
             lock_root: &env.lock_root,
+            grub_config: &env.grub_config,
+            grub_config_d: &env.grub_config_d,
+            grub_cfg: &env.grub_cfg,
+            grub_dropin_target: &env.grub_dropin_target,
+            kernel_cmdline: &env.kernel_cmdline,
+            boot_backup_dir: &env.boot_backup_dir,
         }
     }
 
@@ -280,18 +458,204 @@ mod tests {
         }
     }
 
+    fn has_none(_: &str) -> bool {
+        false
+    }
+
+    fn runner_never(_: &str, _: Vec<&OsStr>) -> Result<CommandOutput, Error> {
+        panic!("runner must not be invoked when no backend is selected");
+    }
+
+    fn applied_runner(_: &str, _: Vec<&OsStr>) -> Result<CommandOutput, Error> {
+        Ok(CommandOutput {
+            exit_code: Some(0),
+            stdout: vec![],
+            stderr: vec![],
+        })
+    }
+
+    fn seed_grub_tree(env: &Env, main_content: &str) {
+        fs::write(&env.grub_config, main_content).unwrap();
+        fs::create_dir_all(&env.grub_config_d).unwrap();
+        fs::write(&env.grub_cfg, b"# managed\n").unwrap();
+    }
+
     #[test]
-    fn boot_deploy_is_always_refused_with_message() {
+    fn boot_deploy_skipped_when_profile_has_no_boot_args() {
         let env = env();
         let prof = profile(vec![], vec![], vec![]);
         let report = orchestrate_deploy(
             &inputs(&env, &prof),
             || ReloadStatus::Applied,
             matching_reader(),
+            has_none,
+            runner_never,
         )
         .unwrap();
-        assert_eq!(report.boot.reason, BOOT_DEPLOY_REFUSED);
-        assert!(report.boot.reason.contains("not implemented"));
+        assert!(matches!(
+            report.boot,
+            BootDeployStatus::Skipped(BootSkipReason::NoProfileBootArgs)
+        ));
+    }
+
+    #[test]
+    fn boot_deploy_skipped_when_backend_is_unknown() {
+        let env = env();
+        let prof = profile(vec![], vec!["quiet"], vec![]);
+        let report = orchestrate_deploy(
+            &inputs(&env, &prof),
+            || ReloadStatus::Applied,
+            matching_reader(),
+            has_none,
+            runner_never,
+        )
+        .unwrap();
+        assert!(matches!(
+            report.boot,
+            BootDeployStatus::Skipped(BootSkipReason::BackendUnknown)
+        ));
+    }
+
+    #[test]
+    fn boot_deploy_skipped_when_backend_is_systemd_boot() {
+        let env = env();
+        fs::create_dir_all(env.kernel_cmdline.parent().unwrap()).unwrap();
+        fs::write(&env.kernel_cmdline, b"quiet\n").unwrap();
+        let prof = profile(vec![], vec!["debugfs=off"], vec![]);
+        let report = orchestrate_deploy(
+            &inputs(&env, &prof),
+            || ReloadStatus::Applied,
+            matching_reader(),
+            has_none,
+            runner_never,
+        )
+        .unwrap();
+        assert!(matches!(
+            report.boot,
+            BootDeployStatus::Skipped(BootSkipReason::BackendSystemdBoot)
+        ));
+    }
+
+    #[test]
+    fn boot_deploy_skipped_when_grub_detected_but_files_missing() {
+        // Only grub_cfg present triggers Grub backend; main config + dropin dir absent means nothing to deploy to.
+        let env = env();
+        fs::write(&env.grub_cfg, b"# managed\n").unwrap();
+        let has_grub_tool = |name: &str| name == "update-grub";
+        let prof = profile(vec![], vec!["quiet"], vec![]);
+        let report = orchestrate_deploy(
+            &inputs(&env, &prof),
+            || ReloadStatus::Applied,
+            matching_reader(),
+            has_grub_tool,
+            runner_never,
+        )
+        .unwrap();
+        assert!(matches!(
+            report.boot,
+            BootDeployStatus::Skipped(BootSkipReason::GrubFilesMissing)
+        ));
+    }
+
+    #[test]
+    fn boot_deploy_via_dropin_when_grub_config_d_exists() {
+        let env = env();
+        seed_grub_tree(&env, "GRUB_CMDLINE_LINUX_DEFAULT=\"ro\"\n");
+        let has_grub_tool = |name: &str| name == "update-grub";
+        let prof = profile(vec![], vec!["quiet", "debugfs=off"], vec![]);
+        let report = orchestrate_deploy(
+            &inputs(&env, &prof),
+            || ReloadStatus::Applied,
+            matching_reader(),
+            has_grub_tool,
+            applied_runner,
+        )
+        .unwrap();
+        match report.boot {
+            BootDeployStatus::Applied(summary) => {
+                assert_eq!(summary.mode, BootDeployMode::GrubDropIn);
+                assert_eq!(summary.target, env.grub_dropin_target);
+                assert!(summary.backup.is_none(), "fresh dropin has no prior file");
+                assert!(matches!(
+                    summary.refresh,
+                    RefreshStatus::Applied {
+                        backend: RefreshBackend::UpdateGrub
+                    }
+                ));
+            }
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        let body = fs::read_to_string(&env.grub_dropin_target).unwrap();
+        assert!(body.contains("GRUB_CMDLINE_LINUX_DEFAULT=\"ro quiet debugfs=off\""));
+    }
+
+    #[test]
+    fn boot_deploy_via_main_file_when_only_grub_config_exists() {
+        let env = env();
+        fs::write(&env.grub_config, "GRUB_CMDLINE_LINUX_DEFAULT=\"ro\"\n").unwrap();
+        fs::write(&env.grub_cfg, b"# managed\n").unwrap();
+        // grub_config_d NOT created → drop-in path unavailable, main-file path taken.
+        let has_grub_tool = |name: &str| name == "grub-mkconfig";
+        let prof = profile(vec![], vec!["quiet"], vec![]);
+        let report = orchestrate_deploy(
+            &inputs(&env, &prof),
+            || ReloadStatus::Applied,
+            matching_reader(),
+            has_grub_tool,
+            applied_runner,
+        )
+        .unwrap();
+        match report.boot {
+            BootDeployStatus::Applied(summary) => {
+                assert_eq!(summary.mode, BootDeployMode::GrubMainFile);
+                assert_eq!(summary.target, env.grub_config);
+                assert!(summary.backup.is_some(), "existing main must be backed up");
+            }
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        let body = fs::read_to_string(&env.grub_config).unwrap();
+        assert!(body.contains("GRUB_CMDLINE_LINUX_DEFAULT=\"ro quiet\""));
+    }
+
+    #[test]
+    fn boot_deploy_propagates_invalid_profile_boot_arg_as_domain_error() {
+        let env = env();
+        seed_grub_tree(&env, "GRUB_CMDLINE_LINUX_DEFAULT=\"\"\n");
+        let prof = profile(vec![], vec!["bad arg with space"], vec![]);
+        let report = orchestrate_deploy(
+            &inputs(&env, &prof),
+            || ReloadStatus::Applied,
+            matching_reader(),
+            |name| name == "update-grub",
+            runner_never,
+        )
+        .unwrap();
+        assert!(matches!(report.boot, BootDeployStatus::DomainError(_)));
+    }
+
+    #[test]
+    fn boot_deploy_propagates_main_parse_error_as_domain_error() {
+        let env = env();
+        // Malformed main config; no drop-in dir so main-file path is chosen and fails at parse time.
+        fs::write(
+            &env.grub_config,
+            b"GRUB_CMDLINE_LINUX_DEFAULT=\"unterminated\n",
+        )
+        .unwrap();
+        fs::write(&env.grub_cfg, b"# managed\n").unwrap();
+        let prof = profile(vec![], vec!["quiet"], vec![]);
+        let report = orchestrate_deploy(
+            &inputs(&env, &prof),
+            || ReloadStatus::Applied,
+            matching_reader(),
+            |name| name == "update-grub",
+            runner_never,
+        )
+        .unwrap();
+        assert!(matches!(
+            report.boot,
+            BootDeployStatus::DomainError(Error::Parse { .. })
+        ));
     }
 
     #[test]
@@ -302,6 +666,8 @@ mod tests {
             &inputs(&env, &prof),
             || ReloadStatus::Applied,
             matching_reader(),
+            has_none,
+            runner_never,
         )
         .unwrap();
         match report.modules {
@@ -325,6 +691,8 @@ mod tests {
                 ReloadStatus::Applied
             },
             matching_reader(),
+            has_none,
+            runner_never,
         )
         .unwrap();
         assert!(called);
@@ -348,6 +716,8 @@ mod tests {
             &inputs(&env, &prof),
             || ReloadStatus::Applied,
             matching_reader(),
+            has_none,
+            runner_never,
         )
         .unwrap();
         let summary = report.modules.unwrap();
@@ -370,6 +740,8 @@ mod tests {
             &inputs(&env, &prof),
             || ReloadStatus::Applied,
             matching_reader(),
+            has_none,
+            runner_never,
         )
         .unwrap();
         let summary = report.modules.unwrap();
@@ -378,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    fn exit_code_zero_when_both_domains_ok_and_boot_refused() {
+    fn exit_code_zero_when_domains_ok_and_boot_skipped() {
         let env = env();
         write_mode_0o600(&env.snapshot_path, "ext4\n");
         seed_installed_modules(&env, &["ext4"]);
@@ -387,6 +759,8 @@ mod tests {
             &inputs(&env, &prof),
             || ReloadStatus::Applied,
             matching_reader(),
+            has_none,
+            runner_never,
         )
         .unwrap();
         assert!(report.sysctl.is_ok());
@@ -404,6 +778,8 @@ mod tests {
             &inputs(&env, &prof),
             || ReloadStatus::Applied,
             matching_reader(),
+            has_none,
+            runner_never,
         )
         .unwrap();
         assert!(report.sysctl.is_err());
@@ -418,6 +794,8 @@ mod tests {
             &inputs(&env, &prof),
             || ReloadStatus::Applied,
             matching_reader(),
+            has_none,
+            runner_never,
         )
         .unwrap();
         assert!(report.modules.is_err());
@@ -436,6 +814,8 @@ mod tests {
                 ReloadStatus::Applied
             },
             matching_reader(),
+            has_none,
+            runner_never,
         )
         .unwrap();
         assert_eq!(count, 1);
@@ -450,6 +830,8 @@ mod tests {
             &inputs(&env, &prof),
             || ReloadStatus::Applied,
             matching_reader(),
+            has_none,
+            runner_never,
         );
         assert!(matches!(result, Err(Error::Lock { .. })));
         assert!(!env.sysctl_target.exists());
@@ -466,12 +848,16 @@ mod tests {
             &inputs(&env, &prof),
             || ReloadStatus::Applied,
             matching_reader(),
+            has_none,
+            runner_never,
         )
         .unwrap();
         orchestrate_deploy(
             &inputs(&env, &prof),
             || ReloadStatus::Applied,
             matching_reader(),
+            has_none,
+            runner_never,
         )
         .unwrap();
     }
@@ -489,6 +875,8 @@ mod tests {
             &inputs(&env, &prof),
             || ReloadStatus::Applied,
             matching_reader(),
+            has_none,
+            runner_never,
         )
         .unwrap();
         assert!(matches!(report.sysctl, Err(Error::UnsafePath { .. })));
@@ -510,6 +898,8 @@ mod tests {
             &inputs(&env, &prof),
             || ReloadStatus::Applied,
             matching_reader(),
+            has_none,
+            runner_never,
         )
         .unwrap();
         assert!(matches!(report.modules, Err(Error::UnsafePath { .. })));
@@ -525,6 +915,8 @@ mod tests {
             &inputs(&env, &prof),
             || ReloadStatus::Applied,
             matching_reader(),
+            has_none,
+            runner_never,
         )
         .unwrap_err();
         assert_eq!(classify_deploy_error(&err), 3);
@@ -538,6 +930,8 @@ mod tests {
             &inputs(&env, &prof),
             || ReloadStatus::Applied,
             matching_reader(),
+            has_none,
+            runner_never,
         )
         .unwrap();
         assert_eq!(report.exit_code(), 1);
@@ -558,6 +952,8 @@ mod tests {
             &inputs(&env, &prof),
             || ReloadStatus::Failed("exit 1".to_string()),
             matching_reader(),
+            has_none,
+            runner_never,
         )
         .unwrap();
         assert!(report.sysctl.is_ok());
@@ -573,6 +969,8 @@ mod tests {
             &inputs(&env, &prof),
             || ReloadStatus::Unavailable,
             matching_reader(),
+            has_none,
+            runner_never,
         )
         .unwrap();
         assert_eq!(report.exit_code(), 1);
@@ -583,9 +981,14 @@ mod tests {
         let env = env_with_modules_ready();
         let prof = profile(vec![("kernel.kptr_restrict", "2")], vec![], vec![]);
         let drift_reader = |_: &SysctlKey| LiveRead::Value("0".to_string());
-        let report =
-            orchestrate_deploy(&inputs(&env, &prof), || ReloadStatus::Applied, drift_reader)
-                .unwrap();
+        let report = orchestrate_deploy(
+            &inputs(&env, &prof),
+            || ReloadStatus::Applied,
+            drift_reader,
+            has_none,
+            runner_never,
+        )
+        .unwrap();
         assert!(report.sysctl.is_ok());
         assert_eq!(report.exit_code(), 1);
     }
@@ -598,6 +1001,8 @@ mod tests {
             &inputs(&env, &prof),
             || ReloadStatus::Applied,
             matching_reader(),
+            has_none,
+            runner_never,
         )
         .unwrap();
         assert!(report.sysctl.is_ok());
@@ -620,6 +1025,8 @@ mod tests {
             &inputs(&env, &prof),
             || ReloadStatus::Unavailable,
             matching_reader(),
+            has_none,
+            runner_never,
         )
         .unwrap();
         assert_eq!(report.exit_code(), 3);
@@ -627,7 +1034,6 @@ mod tests {
 
     #[test]
     fn classify_deploy_error_maps_security_variants_to_three() {
-        use std::path::PathBuf;
         assert_eq!(
             classify_deploy_error(&Error::UnsafePath {
                 path: PathBuf::from("/x"),
@@ -668,6 +1074,8 @@ mod tests {
             &inputs(&env, &prof),
             || ReloadStatus::Applied,
             matching_reader(),
+            has_none,
+            runner_never,
         )
         .unwrap();
         assert!(matches!(report.modules.unwrap_err(), Error::Io(_)));

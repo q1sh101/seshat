@@ -7,9 +7,10 @@ mod rollback;
 mod status;
 mod verify;
 
+pub(crate) use deploy::deploy_boot_domain;
 pub use deploy::{
-    BOOT_DEPLOY_REFUSED, BootDeployStatus, DeployInputs, DeployReport, classify_deploy_error,
-    orchestrate_deploy,
+    BootDeployMode, BootDeployStatus, BootDeploySummary, BootSkipReason, DeployInputs,
+    DeployReport, classify_deploy_error, orchestrate_deploy,
 };
 pub use lock::{LockInputs, LockReport, classify_lock_error, orchestrate_lock};
 pub use plan::{PlanInputs, PlanReport, orchestrate_plan};
@@ -48,6 +49,12 @@ mod cross_domain_lock_tests {
         modprobe_target: PathBuf,
         modprobe_backup_dir: PathBuf,
         lock_root: PathBuf,
+        grub_config: PathBuf,
+        grub_config_d: PathBuf,
+        grub_cfg: PathBuf,
+        grub_dropin_target: PathBuf,
+        kernel_cmdline: PathBuf,
+        boot_backup_dir: PathBuf,
     }
 
     fn env() -> Env {
@@ -61,6 +68,12 @@ mod cross_domain_lock_tests {
         let modprobe_target = root.path().join("modprobe.d/99-test.conf");
         let modprobe_backup_dir = root.path().join("backups/modules");
         let lock_root = root.path().join("locks");
+        let grub_config = root.path().join("etc/default/grub");
+        let grub_config_d = root.path().join("etc/default/grub.d");
+        let grub_cfg = root.path().join("boot/grub/grub.cfg");
+        let grub_dropin_target = grub_config_d.join("99-test.cfg");
+        let kernel_cmdline = root.path().join("etc/kernel/cmdline");
+        let boot_backup_dir = root.path().join("backups/boot");
         fs::create_dir_all(&modules_dir).unwrap();
         fs::create_dir_all(sysctl_target.parent().unwrap()).unwrap();
         fs::create_dir_all(&sysctl_backup_dir).unwrap();
@@ -68,6 +81,9 @@ mod cross_domain_lock_tests {
         fs::create_dir_all(&modprobe_backup_dir).unwrap();
         fs::create_dir_all(&lock_root).unwrap();
         fs::set_permissions(&lock_root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir_all(grub_config.parent().unwrap()).unwrap();
+        fs::create_dir_all(grub_cfg.parent().unwrap()).unwrap();
+        fs::create_dir_all(&boot_backup_dir).unwrap();
         Env {
             _root: root,
             modules_dir,
@@ -79,6 +95,12 @@ mod cross_domain_lock_tests {
             modprobe_target,
             modprobe_backup_dir,
             lock_root,
+            grub_config,
+            grub_config_d,
+            grub_cfg,
+            grub_dropin_target,
+            kernel_cmdline,
+            boot_backup_dir,
         }
     }
 
@@ -108,6 +130,12 @@ mod cross_domain_lock_tests {
             modprobe_target: &env.modprobe_target,
             modprobe_backup_dir: &env.modprobe_backup_dir,
             lock_root: &env.lock_root,
+            grub_config: &env.grub_config,
+            grub_config_d: &env.grub_config_d,
+            grub_cfg: &env.grub_cfg,
+            grub_dropin_target: &env.grub_dropin_target,
+            kernel_cmdline: &env.kernel_cmdline,
+            boot_backup_dir: &env.boot_backup_dir,
         }
     }
 
@@ -139,6 +167,10 @@ mod cross_domain_lock_tests {
             &deploy_inputs(&env, &prof),
             || ReloadStatus::Applied,
             noop_reader(),
+            |_: &str| false,
+            |_: &str, _: Vec<&std::ffi::OsStr>| {
+                panic!("runner must not run with no grub backend present")
+            },
         );
         assert!(matches!(result, Err(Error::Lock { .. })));
         assert!(!env.sysctl_target.exists());

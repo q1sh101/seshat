@@ -132,14 +132,16 @@ fn deploy_modules_writes_modprobe_tree_only() {
 }
 
 #[test]
-fn deploy_boot_exits_three_and_writes_nothing() {
+fn deploy_boot_without_profile_args_skips_and_writes_nothing() {
+    // Boot-only deploy should skip cleanly when the profile has no boot args.
     let tmp = seed_fake_root();
     let root = tmp.path().to_str().unwrap();
-    let (code, _, stderr) = run(&["--root", root, "deploy", "boot"]);
-    assert_eq!(code, 3);
+    let (code, stdout, stderr) = run(&["--root", root, "deploy", "boot"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let combined = format!("{stdout}{stderr}");
     assert!(
-        stderr.contains("boot deploy not implemented"),
-        "stderr: {stderr}"
+        combined.contains("profile has no boot args"),
+        "combined: {combined}"
     );
     assert!(
         !tmp.path()
@@ -163,7 +165,8 @@ fn deploy_all_covers_sysctl_and_modules_with_boot_reported_refused() {
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(stdout.contains("deploy sysctl"));
     assert!(stdout.contains("deploy modules"));
-    assert!(stdout.contains("boot deploy not implemented"));
+    // Baseline profile has no [[boot]] args; orchestrator reports a skip reason.
+    assert!(stdout.contains("profile has no boot args"));
     assert!(
         tmp.path()
             .join("etc/sysctl.d/99-kernel-hardening.conf")
@@ -445,6 +448,52 @@ fn modules_allow_refuses_symlinked_backup_dir() {
     fs::remove_dir_all(&symlink_path).ok();
     std::os::unix::fs::symlink(elsewhere.path(), &symlink_path).unwrap();
     let (code, _, stderr) = run(&["--root", root, "modules", "allow", "ext4"]);
+    assert_eq!(code, 3, "stderr: {stderr}");
+    assert!(stderr.contains("symlink"), "stderr: {stderr}");
+    assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn deploy_all_refuses_symlinked_boot_backup_dir() {
+    let tmp = seed_fake_root();
+    let root = tmp.path().to_str().unwrap();
+    assert_eq!(run(&["--root", root, "snapshot"]).0, 0);
+    let elsewhere = tempfile::tempdir().unwrap();
+    let dir = profiles_dir(tmp.path());
+    std::os::unix::fs::symlink(elsewhere.path(), dir.join("backups-boot")).unwrap();
+    let (code, _, stderr) = run(&["--root", root, "deploy", "all"]);
+    assert_eq!(code, 3, "stderr: {stderr}");
+    assert!(stderr.contains("symlink"), "stderr: {stderr}");
+    assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn deploy_all_refuses_symlinked_grub_config_d() {
+    let tmp = seed_fake_root();
+    let root = tmp.path().to_str().unwrap();
+    assert_eq!(run(&["--root", root, "snapshot"]).0, 0);
+    // Seed seed_fake_root creates etc/default/grub.d as a real dir; replace it with a symlink.
+    let grub_d = tmp.path().join("etc/default/grub.d");
+    fs::remove_dir_all(&grub_d).unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), &grub_d).unwrap();
+    let (code, _, stderr) = run(&["--root", root, "deploy", "all"]);
+    assert_eq!(code, 3, "stderr: {stderr}");
+    assert!(stderr.contains("symlink"), "stderr: {stderr}");
+    assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn deploy_all_refuses_symlinked_grub_config_parent() {
+    let tmp = seed_fake_root();
+    let root = tmp.path().to_str().unwrap();
+    assert_eq!(run(&["--root", root, "snapshot"]).0, 0);
+    // Replace <root>/etc/default with a symlink to trigger refuse at grub_config.parent().
+    let etc_default = tmp.path().join("etc/default");
+    fs::remove_dir_all(&etc_default).unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), &etc_default).unwrap();
+    let (code, _, stderr) = run(&["--root", root, "deploy", "all"]);
     assert_eq!(code, 3, "stderr: {stderr}");
     assert!(stderr.contains("symlink"), "stderr: {stderr}");
     assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 0);
