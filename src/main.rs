@@ -15,16 +15,19 @@ mod result;
 mod runtime;
 mod sysctl;
 
+use std::cell::RefCell;
+use std::io::IsTerminal;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use cli::{Command, Domain, ModulesCmd, SnapshotCmd};
 use error::Error;
-use modules::PendingReport;
+use modules::{ModulesLockOutcome, ModulesRestore, PendingReport};
 use orchestrator::{
-    BOOT_DEPLOY_REFUSED, DeployInputs, PlanInputs, StatusInputs, VerifyInputs,
-    classify_deploy_error, orchestrate_deploy, orchestrate_plan, orchestrate_status,
-    orchestrate_verify,
+    BOOT_DEPLOY_REFUSED, BOOT_ROLLBACK_REFUSED, DeployInputs, LockInputs, LockReport, PlanInputs,
+    RollbackDomain, RollbackInputs, RollbackOutcome, StatusInputs, VerifyInputs,
+    classify_deploy_error, orchestrate_deploy, orchestrate_lock, orchestrate_plan,
+    orchestrate_rollback, orchestrate_status, orchestrate_verify,
 };
 use paths::ensure_dir;
 use policy::{ModuleName, Profile, ProfileName};
@@ -85,6 +88,8 @@ fn dispatch(command: Command, root: Option<&Path>) -> i32 {
         Command::Verify { profile, domain } => dispatch_verify(profile, domain, root),
         Command::Status { profile, domain } => dispatch_status(profile, domain, root),
         Command::Deploy { profile, domain } => dispatch_deploy(profile, domain, root),
+        Command::Rollback { yes, domain } => dispatch_rollback(yes, domain, root),
+        Command::Lock { yes } => dispatch_lock(yes, root),
         other => {
             eprintln!("{other:?}: not implemented");
             1
@@ -886,6 +891,289 @@ fn matches_domain(selected: Domain, target: Domain) -> bool {
     matches!(selected, Domain::All) || selected == target
 }
 
+fn dispatch_rollback(yes: bool, domain: Domain, root: Option<&Path>) -> i32 {
+    // Boot refusal BEFORE any filesystem mutation.
+    if matches!(domain, Domain::Boot) {
+        output::fail(&format!(
+            "preflight refused for boot: {BOOT_ROLLBACK_REFUSED}"
+        ));
+        return 3;
+    }
+
+    let paths = match cli_paths(root) {
+        Ok(p) => p,
+        Err(e) => return print_error_exit(&e, 1),
+    };
+
+    let interactive = std::io::stdin().is_terminal();
+    // Authorize BEFORE any directory creation so refused/aborted paths touch nothing.
+    if !yes {
+        if !interactive {
+            output::fail("noninteractive session: pass --yes to confirm");
+            return 1;
+        }
+        if !production_prompt_closure("rollback")() {
+            output::log("rollback: aborted");
+            return 0;
+        }
+    }
+
+    if let Err(e) = ensure_lock_root(&paths.lock_root) {
+        return print_error_exit(&e, 1);
+    }
+    // Ensure target parent only when a backup is staged (Restored path writes via install_root_file).
+    if matches!(domain, Domain::Sysctl | Domain::All) {
+        match sysctl_backup_exists(&paths) {
+            Ok(true) => {
+                if let Some(parent) = paths.sysctl_target.parent()
+                    && let Err(e) = ensure_dir(parent)
+                {
+                    return print_error_exit(&e, 1);
+                }
+            }
+            Ok(false) => {}
+            Err(e) => return print_error_exit(&e, 1),
+        }
+    }
+    if matches!(domain, Domain::Modules | Domain::All) {
+        match modules_backup_exists(&paths) {
+            Ok(true) => {
+                if let Some(parent) = paths.modprobe_target.parent()
+                    && let Err(e) = ensure_dir(parent)
+                {
+                    return print_error_exit(&e, 1);
+                }
+            }
+            Ok(false) => {}
+            Err(e) => return print_error_exit(&e, 1),
+        }
+    }
+
+    let inputs = RollbackInputs {
+        domain: to_rollback_domain(domain),
+        // Auth already done; skip orchestrator's prompt to avoid stale prompts on stdin.
+        yes: true,
+        interactive,
+        lock_root: &paths.lock_root,
+    };
+
+    // Capture rich modules/sysctl outcomes; orchestrator's RollbackOutcome drops reboot signal.
+    let modules_capture: RefCell<Option<ModulesRestore>> = RefCell::new(None);
+    let sysctl_capture: RefCell<Option<ReloadStatus>> = RefCell::new(None);
+
+    let sysctl_target = paths.sysctl_target.clone();
+    let sysctl_backup_dir = paths.sysctl_backup_dir.clone();
+    let proc_sys_root = paths.proc_sys_root.clone();
+    let root_owned = root.map(|r| r.to_path_buf());
+    let sysctl_restore = || -> Result<RollbackOutcome, Error> {
+        let reload = sysctl_reload_closure(root_owned.as_deref());
+        let outcome =
+            sysctl::restore_sysctl_from_backup(&sysctl_target, &sysctl_backup_dir, reload)?;
+        *sysctl_capture.borrow_mut() = Some(outcome.reload.clone());
+        Ok(RollbackOutcome {
+            restored_from: Some(outcome.restored_from),
+        })
+    };
+    let _ = proc_sys_root;
+
+    let modprobe_target = paths.modprobe_target.clone();
+    let modules_backup_dir = paths.modules_backup_dir.clone();
+    let modules_restore = || -> Result<RollbackOutcome, Error> {
+        let outcome = modules::restore_modules_from_backup(&modprobe_target, &modules_backup_dir)?;
+        let restored_from = match &outcome {
+            ModulesRestore::Restored { from } => Some(from.clone()),
+            _ => None,
+        };
+        *modules_capture.borrow_mut() = Some(outcome);
+        Ok(RollbackOutcome { restored_from })
+    };
+
+    // yes=true bypass; prompt is unreachable but the closure must still type-check.
+    let confirm = || true;
+    match orchestrate_rollback(&inputs, confirm, sysctl_restore, modules_restore) {
+        Ok(report) => {
+            if report.aborted {
+                output::log("rollback: aborted");
+                return 0;
+            }
+            if let Some(Ok(out)) = &report.sysctl {
+                output::ok(&format!(
+                    "rollback sysctl: restored from {}",
+                    out.restored_from
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                ));
+                if let Some(reload) = sysctl_capture.into_inner() {
+                    output::log(&format!("reload={reload:?}"));
+                }
+            } else if let Some(Err(e)) = &report.sysctl {
+                output::fail(&format!("rollback sysctl: {e}"));
+            }
+            if let Some(result) = &report.modules {
+                render_modules_rollback_outcome(result, modules_capture.into_inner().as_ref());
+            }
+            let code = report.exit_code();
+            if code == 0 {
+                output::log("verify with: seshat verify");
+            }
+            code
+        }
+        Err(e) => {
+            output::fail(&format!("{e}"));
+            orchestrator::classify_rollback_error(&e)
+        }
+    }
+}
+
+fn render_modules_rollback_outcome(
+    result: &Result<RollbackOutcome, Error>,
+    rich: Option<&ModulesRestore>,
+) {
+    match result {
+        Ok(_) => {
+            match rich {
+                Some(ModulesRestore::Restored { from }) => {
+                    output::ok(&format!(
+                        "rollback modules: restored from {}",
+                        from.display()
+                    ));
+                }
+                Some(ModulesRestore::Removed { target }) => {
+                    output::ok(&format!("rollback modules: removed {}", target.display()));
+                }
+                Some(ModulesRestore::NothingToRollback) => {
+                    output::skip("rollback modules: nothing to rollback");
+                }
+                None => output::ok("rollback modules: completed"),
+            }
+            if let Some(m) = rich
+                && m.reboot_required()
+            {
+                output::warn("reboot required for already-loaded modules");
+            }
+        }
+        Err(e) => output::fail(&format!("rollback modules: {e}")),
+    }
+}
+
+// Regular-file check: a symlink backup must not trigger parent-dir creation since the
+// restore primitive will reject it as UnsafePath and the refused path must touch nothing.
+fn selected_backup_is_regular_file(
+    basename: &std::ffi::OsStr,
+    backup_dir: &Path,
+) -> Result<bool, Error> {
+    let Some(backup) = backup::latest_backup_for(basename, backup_dir)? else {
+        return Ok(false);
+    };
+    let meta = std::fs::symlink_metadata(&backup).map_err(Error::Io)?;
+    Ok(meta.file_type().is_file())
+}
+
+fn sysctl_backup_exists(paths: &CliPaths) -> Result<bool, Error> {
+    let basename = paths
+        .sysctl_target
+        .file_name()
+        .ok_or_else(|| Error::Validation {
+            field: "sysctl.target".to_string(),
+            reason: "target has no file name".to_string(),
+        })?;
+    selected_backup_is_regular_file(basename, &paths.sysctl_backup_dir)
+}
+
+fn modules_backup_exists(paths: &CliPaths) -> Result<bool, Error> {
+    let basename = paths
+        .modprobe_target
+        .file_name()
+        .ok_or_else(|| Error::Validation {
+            field: "modules.target".to_string(),
+            reason: "target has no file name".to_string(),
+        })?;
+    selected_backup_is_regular_file(basename, &paths.modules_backup_dir)
+}
+
+fn to_rollback_domain(d: Domain) -> RollbackDomain {
+    match d {
+        Domain::All => RollbackDomain::All,
+        Domain::Sysctl => RollbackDomain::Sysctl,
+        Domain::Modules => RollbackDomain::Modules,
+        Domain::Boot => RollbackDomain::Boot,
+    }
+}
+
+fn dispatch_lock(yes: bool, root: Option<&Path>) -> i32 {
+    let paths = match cli_paths(root) {
+        Ok(p) => p,
+        Err(e) => return print_error_exit(&e, 1),
+    };
+    let inputs = LockInputs {
+        proc_file: &paths.modules_disabled,
+        yes,
+        interactive: std::io::stdin().is_terminal(),
+    };
+    let confirm = production_prompt_closure("lock");
+    let is_root = is_root_probe(root);
+    match orchestrate_lock(&inputs, confirm, is_root) {
+        Ok(LockReport::Aborted) => {
+            output::log("lock: aborted");
+            0
+        }
+        Ok(LockReport::Completed(Ok(ModulesLockOutcome::LockedNow))) => {
+            output::ok("lock: module loading disabled until reboot");
+            output::warn("reboot is the only way to re-enable module loading");
+            0
+        }
+        Ok(LockReport::Completed(Ok(ModulesLockOutcome::AlreadyLocked))) => {
+            output::ok("lock: already locked (no-op)");
+            0
+        }
+        Ok(LockReport::Completed(Err(e))) => {
+            output::fail(&format!("{e}"));
+            orchestrator::classify_lock_error(&e)
+        }
+        Err(e) => {
+            output::fail(&format!("{e}"));
+            orchestrator::classify_lock_error(&e)
+        }
+    }
+}
+
+// Stub under --root; on bare host reads /proc/self/status Uid effective field.
+fn is_root_probe(root: Option<&Path>) -> impl FnOnce() -> bool + use<> {
+    let under_root = root.is_some();
+    move || {
+        if under_root {
+            std::env::var_os("SESHAT_SMOKE_AS_ROOT").is_some_and(|v| v == "1")
+        } else {
+            read_effective_uid() == Some(0)
+        }
+    }
+}
+
+fn read_effective_uid() -> Option<u32> {
+    let raw = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:") {
+            let mut fields = rest.split_whitespace();
+            let _real = fields.next()?;
+            return fields.next()?.parse().ok();
+        }
+    }
+    None
+}
+
+// Reads one line from stdin; empty / non-"y" answer declines.
+fn production_prompt_closure(action: &'static str) -> impl FnOnce() -> bool + use<> {
+    move || {
+        eprint!("seshat: {action}? [y/N] ");
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return false;
+        }
+        matches!(line.trim(), "y" | "Y" | "yes" | "YES")
+    }
+}
+
 fn load_profile(root: Option<&Path>, raw_name: Option<&str>) -> Result<Profile, Error> {
     // Validate profile name BEFORE any path join or filesystem access.
     let name_str = raw_name.unwrap_or(DEFAULT_PROFILE);
@@ -1072,7 +1360,7 @@ fn ensure_lock_root(path: &Path) -> Result<(), Error> {
 }
 
 fn print_error_exit(err: &Error, default_code: i32) -> i32 {
-    eprintln!("error: {err}");
+    output::fail(&format!("{err}"));
     match err {
         Error::UnsafePath { .. }
         | Error::PreflightRefused { .. }
