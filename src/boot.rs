@@ -4,6 +4,7 @@ mod deploy;
 mod dropin;
 mod mainconfig;
 mod plan;
+mod refresh;
 mod verify;
 
 pub use backend::{Backend, default_has_command, detect_backend};
@@ -12,4 +13,5 @@ pub use deploy::{DeploySummary, deploy_grub_dropin, deploy_grub_main_config};
 pub use dropin::generate_grub_dropin;
 pub use mainconfig::merge_grub_main_config;
 pub use plan::{BootPlan, PlanRow, PlanState, plan_boot_params};
+pub use refresh::{RefreshBackend, RefreshStatus, refresh_grub_configuration};
 pub use verify::{BootVerify, VerifyRow, read_live_cmdline, verify_boot_params};
