@@ -1,6 +1,7 @@
 pub const OPERATION_LOCK_NAME: &str = "operation";
 
 mod deploy;
+mod lock;
 mod plan;
 mod rollback;
 mod status;
@@ -10,6 +11,7 @@ pub use deploy::{
     BOOT_DEPLOY_REFUSED, BootDeployStatus, DeployInputs, DeployReport, classify_deploy_error,
     orchestrate_deploy,
 };
+pub use lock::{LockInputs, LockReport, classify_lock_error, orchestrate_lock};
 pub use plan::{PlanInputs, PlanReport, orchestrate_plan};
 pub use rollback::{
     BOOT_ROLLBACK_REFUSED, RollbackDomain, RollbackInputs, RollbackOutcome, RollbackReport,

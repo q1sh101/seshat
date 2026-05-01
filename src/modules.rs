@@ -7,6 +7,7 @@ mod overlay;
 mod pending;
 mod plan;
 mod restore;
+mod runtime_lock;
 mod snapshot;
 mod verify;
 
@@ -18,5 +19,6 @@ pub use overlay::{EditOutcome, allow_module, block_module, unallow_module, unblo
 pub use pending::{PendingReport, check_pending_modules};
 pub use plan::{EnforcementPlan, PlanRow, PlanState, plan_enforcement};
 pub use restore::{ModulesRestore, restore_modules_from_backup};
+pub use runtime_lock::{ModulesLockOutcome, lock_modules_runtime, read_modules_lock_state};
 pub use snapshot::{ResetSummary, SnapshotSummary, create_snapshot, reset_snapshot};
 pub use verify::{VerifyReport, VerifyRow, verify_enforcement};
