@@ -57,7 +57,10 @@ where
     install_root_file(target, payload.as_bytes(), 0o644)?;
 
     // Re-read to catch post-rename corruption before triggering a kernel reload.
-    let live = std::fs::read_to_string(target)?;
+    let live = std::fs::read_to_string(target).map_err(|e| Error::Validation {
+        field: "post_write_verify_read".to_string(),
+        reason: format!("cannot re-read {} after install: {e}", target.display()),
+    })?;
     if live != payload {
         return Err(Error::Validation {
             field: "post_write_verify".to_string(),

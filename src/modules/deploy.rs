@@ -27,7 +27,10 @@ pub fn deploy_enforcement(
     install_root_file(target, payload.as_bytes(), 0o644)?;
 
     // Re-read and compare signatures to catch post-rename corruption.
-    let live = std::fs::read_to_string(target)?;
+    let live = std::fs::read_to_string(target).map_err(|e| Error::Validation {
+        field: "post_write_verify_read".to_string(),
+        reason: format!("cannot re-read {} after install: {e}", target.display()),
+    })?;
     if payload_signature(&live) != payload_signature(&payload) {
         return Err(Error::Validation {
             field: "post_write_verify".to_string(),

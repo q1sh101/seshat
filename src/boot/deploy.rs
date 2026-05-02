@@ -39,7 +39,10 @@ pub fn deploy_grub_main_config(
     backup_dir: &Path,
 ) -> Result<DeploySummary, Error> {
     preflight_main_target(target)?;
-    let content = std::fs::read_to_string(target)?;
+    let content = std::fs::read_to_string(target).map_err(|e| Error::Validation {
+        field: "pre_write_read".to_string(),
+        reason: format!("cannot read {} before merge: {e}", target.display()),
+    })?;
     let updated = merge_grub_main_config(&content, merged_cmdline)?;
     let backup = create_backup(target, backup_dir)?;
     install_root_file(target, updated.as_bytes(), GRUB_DEPLOY_MODE)?;
@@ -77,7 +80,10 @@ fn preflight_main_target(target: &Path) -> Result<(), Error> {
 }
 
 fn verify_on_disk(target: &Path, expected: &str) -> Result<(), Error> {
-    let live = std::fs::read_to_string(target)?;
+    let live = std::fs::read_to_string(target).map_err(|e| Error::Validation {
+        field: "post_write_verify_read".to_string(),
+        reason: format!("cannot re-read {} after install: {e}", target.display()),
+    })?;
     if live != expected {
         return Err(Error::Validation {
             field: "post_write_verify".to_string(),
