@@ -5,6 +5,7 @@ mod backup;
 mod boot;
 mod cli;
 mod error;
+mod guard;
 mod lock;
 mod modules;
 mod orchestrator;
@@ -14,6 +15,7 @@ mod policy;
 mod result;
 mod runtime;
 mod sysctl;
+mod watch;
 
 use std::cell::RefCell;
 use std::io::IsTerminal;
@@ -21,7 +23,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use boot::{BootRestore, RefreshStatus};
-use cli::{Command, Domain, ModulesCmd, SnapshotCmd};
+use cli::{Command, Domain, GuardCmd, ModulesCmd, SnapshotCmd, WatchCmd};
 use error::Error;
 use modules::{ModulesLockOutcome, ModulesRestore, PendingReport};
 use orchestrator::{
@@ -91,10 +93,8 @@ fn dispatch(command: Command, root: Option<&Path>) -> i32 {
         Command::Deploy { profile, domain } => dispatch_deploy(profile, domain, root),
         Command::Rollback { yes, domain } => dispatch_rollback(yes, domain, root),
         Command::Lock { yes } => dispatch_lock(yes, root),
-        other => {
-            eprintln!("{other:?}: not implemented");
-            1
-        }
+        Command::Watch(sub) => dispatch_watch(sub, root),
+        Command::Guard(sub) => dispatch_guard(sub, root),
     }
 }
 
@@ -1342,6 +1342,375 @@ fn dispatch_lock(yes: bool, root: Option<&Path>) -> i32 {
             orchestrator::classify_lock_error(&e)
         }
     }
+}
+
+fn dispatch_watch(sub: WatchCmd, root: Option<&Path>) -> i32 {
+    match sub {
+        WatchCmd::Install { profile } => dispatch_watch_install(profile, root),
+        WatchCmd::Remove => dispatch_watch_remove(root),
+        WatchCmd::Status => dispatch_watch_status(root),
+        WatchCmd::Run { profile } => dispatch_verify(profile, Domain::All, root),
+    }
+}
+
+fn dispatch_watch_install(profile: Option<String>, root: Option<&Path>) -> i32 {
+    let prof = match ProfileName::new(profile.as_deref().unwrap_or(DEFAULT_PROFILE)) {
+        Ok(p) => p,
+        Err(e) => return print_error_exit(&e, 1),
+    };
+    let env = match watch_env(root) {
+        Ok(e) => e,
+        Err(code) => return code,
+    };
+    let system_state_root = match root {
+        Some(r) => r.join("var/lib/seshat"),
+        None => PathBuf::from("/var/lib/seshat"),
+    };
+    if let Err(e) = stage_profile_for_service(&env.state_root, &system_state_root, &prof) {
+        return print_error_exit(&e, system_service_exit_code(&e));
+    }
+    let inputs = watch::WatchInputs {
+        binary_path: &env.binary_path,
+        profile: &prof,
+        state_root: &system_state_root,
+        unit_dir: &env.unit_dir,
+        service_unit: &env.service_unit,
+        path_unit: &env.path_unit,
+        timer_unit: &env.timer_unit,
+        sysctl_dropin: &env.sysctl_dropin,
+        modprobe_dropin: &env.modprobe_dropin,
+    };
+    match watch::install_watch(&inputs, system_runner(root)) {
+        Ok(()) => {
+            output::ok("watch: installed kernel-hardening-watch.{service,path,timer}");
+            output::log(&format!("profile={}", prof.as_str()));
+            output::log(&format!("state_root={}", system_state_root.display()));
+            output::log("timer=1h (first run 5min after boot)");
+            0
+        }
+        Err(e) => print_error_exit(&e, system_service_exit_code(&e)),
+    }
+}
+
+// Install trusts the source: validate schema + content only, skip the verify-time uid rule.
+fn stage_profile_for_service(
+    source_state_root: &Path,
+    dest_state_root: &Path,
+    profile: &ProfileName,
+) -> Result<(), Error> {
+    let source = source_state_root
+        .join(PROFILES_SUBDIR)
+        .join(format!("{}.toml", profile.as_str()));
+    let text = std::fs::read_to_string(&source).map_err(Error::Io)?;
+    let parsed: Profile = toml::from_str(&text).map_err(|e| Error::Parse {
+        what: source.display().to_string(),
+        reason: e.to_string(),
+    })?;
+    parsed.check_schema_version()?;
+    parsed.validate_content()?;
+    parsed.check_duplicates()?;
+    let dest_dir = dest_state_root.join(PROFILES_SUBDIR);
+    ensure_dir(&dest_dir)?;
+    let dest = dest_dir.join(format!("{}.toml", profile.as_str()));
+    atomic::install_root_file(&dest, text.as_bytes(), 0o644)?;
+    Ok(())
+}
+
+fn dispatch_watch_remove(root: Option<&Path>) -> i32 {
+    let env = match watch_env(root) {
+        Ok(e) => e,
+        Err(code) => return code,
+    };
+    let prof = match ProfileName::new(DEFAULT_PROFILE) {
+        Ok(p) => p,
+        Err(e) => return print_error_exit(&e, 1),
+    };
+    let inputs = watch::WatchInputs {
+        binary_path: &env.binary_path,
+        profile: &prof,
+        state_root: &env.state_root,
+        unit_dir: &env.unit_dir,
+        service_unit: &env.service_unit,
+        path_unit: &env.path_unit,
+        timer_unit: &env.timer_unit,
+        sysctl_dropin: &env.sysctl_dropin,
+        modprobe_dropin: &env.modprobe_dropin,
+    };
+    match watch::remove_watch(&inputs, system_runner(root)) {
+        Ok(summary) => {
+            output::ok(&format!(
+                "watch: removed service={} path={} timer={}",
+                summary.service_removed, summary.path_removed, summary.timer_removed
+            ));
+            0
+        }
+        Err(e) => print_error_exit(&e, system_service_exit_code(&e)),
+    }
+}
+
+fn dispatch_watch_status(root: Option<&Path>) -> i32 {
+    let env = match watch_env(root) {
+        Ok(e) => e,
+        Err(code) => return code,
+    };
+    let prof = match ProfileName::new(DEFAULT_PROFILE) {
+        Ok(p) => p,
+        Err(e) => return print_error_exit(&e, 1),
+    };
+    let inputs = watch::WatchInputs {
+        binary_path: &env.binary_path,
+        profile: &prof,
+        state_root: &env.state_root,
+        unit_dir: &env.unit_dir,
+        service_unit: &env.service_unit,
+        path_unit: &env.path_unit,
+        timer_unit: &env.timer_unit,
+        sysctl_dropin: &env.sysctl_dropin,
+        modprobe_dropin: &env.modprobe_dropin,
+    };
+    let status = watch::query_watch_status(&inputs, system_runner(root));
+    output::log("watch status");
+    watch_status_line("path unit", status.path_installed, status.path_active, None);
+    watch_status_line(
+        "timer unit",
+        status.timer_installed,
+        status.timer_active,
+        status.next_elapse.as_deref(),
+    );
+    watch_status_line("service", status.service_installed, false, None);
+    if status.journal_tail.is_empty() {
+        output::skip("last journal entries: none");
+    } else {
+        output::log(&format!(
+            "last {} journal entries:",
+            status.journal_tail.len()
+        ));
+        for line in &status.journal_tail {
+            output::log(&format!("  {line}"));
+        }
+    }
+    0
+}
+
+fn watch_status_line(label: &str, installed: bool, active: bool, next: Option<&str>) {
+    if !installed {
+        output::warn(&format!("{label}: not installed"));
+        return;
+    }
+    let suffix = next.map(|n| format!(" next={n}")).unwrap_or_default();
+    if active || next.is_some() {
+        output::ok(&format!("{label}: installed active={active}{suffix}"));
+    } else {
+        output::ok(&format!("{label}: installed"));
+    }
+}
+
+struct WatchEnv {
+    binary_path: PathBuf,
+    state_root: PathBuf,
+    unit_dir: PathBuf,
+    service_unit: PathBuf,
+    path_unit: PathBuf,
+    timer_unit: PathBuf,
+    sysctl_dropin: PathBuf,
+    modprobe_dropin: PathBuf,
+}
+
+fn watch_env(root: Option<&Path>) -> Result<WatchEnv, i32> {
+    let binary_path = match std::env::current_exe() {
+        Ok(p) => match p.canonicalize() {
+            Ok(c) => c,
+            Err(_) => p,
+        },
+        Err(e) => {
+            output::fail(&format!("cannot resolve binary path: {e}"));
+            return Err(1);
+        }
+    };
+    let state_root = match root {
+        Some(r) => r.join("var/lib/seshat"),
+        None => match paths::state_root() {
+            Ok(p) => p,
+            Err(e) => {
+                output::fail(&format!("{e}"));
+                return Err(1);
+            }
+        },
+    };
+    let base = match root {
+        Some(r) => r.to_path_buf(),
+        None => PathBuf::from("/"),
+    };
+    let unit_dir = base.join(paths::SYSTEMD_SYSTEM_DIR.trim_start_matches('/'));
+    let sysctl_dropin = base.join(paths::SYSCTL_DROPIN.trim_start_matches('/'));
+    let modprobe_dropin = base.join(paths::MODPROBE_DROPIN.trim_start_matches('/'));
+    let service_unit = base.join(paths::WATCH_SERVICE_UNIT.trim_start_matches('/'));
+    let path_unit = base.join(paths::WATCH_PATH_UNIT.trim_start_matches('/'));
+    let timer_unit = base.join(paths::WATCH_TIMER_UNIT.trim_start_matches('/'));
+    Ok(WatchEnv {
+        binary_path,
+        state_root,
+        unit_dir,
+        service_unit,
+        path_unit,
+        timer_unit,
+        sysctl_dropin,
+        modprobe_dropin,
+    })
+}
+
+fn system_runner(
+    root: Option<&Path>,
+) -> impl FnMut(&str, Vec<&std::ffi::OsStr>) -> Result<runtime::CommandOutput, Error> + use<> {
+    let under_root = root.is_some();
+    move |program, args| {
+        if under_root {
+            Ok(runtime::CommandOutput {
+                exit_code: Some(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        } else {
+            runtime::run_sanitized(program, args)
+        }
+    }
+}
+
+fn system_service_exit_code(err: &Error) -> i32 {
+    match err {
+        Error::UnsafePath { .. } | Error::PreflightRefused { .. } => 3,
+        _ => 1,
+    }
+}
+
+fn dispatch_guard(sub: GuardCmd, root: Option<&Path>) -> i32 {
+    match sub {
+        GuardCmd::Install => dispatch_guard_install(root),
+        GuardCmd::Remove => dispatch_guard_remove(root),
+        GuardCmd::Status => dispatch_guard_status(root),
+    }
+}
+
+struct GuardEnv {
+    binary_path: PathBuf,
+    state_root: PathBuf,
+    unit_dir: PathBuf,
+    service_unit: PathBuf,
+    modules_disabled: PathBuf,
+}
+
+fn guard_env(root: Option<&Path>) -> Result<GuardEnv, i32> {
+    let binary_path = match std::env::current_exe() {
+        Ok(p) => match p.canonicalize() {
+            Ok(c) => c,
+            Err(_) => p,
+        },
+        Err(e) => {
+            eprintln!("error: cannot resolve binary path: {e}");
+            return Err(1);
+        }
+    };
+    let state_root = match root {
+        Some(r) => r.join("var/lib/seshat"),
+        None => match paths::state_root() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return Err(1);
+            }
+        },
+    };
+    let base = match root {
+        Some(r) => r.to_path_buf(),
+        None => PathBuf::from("/"),
+    };
+    let unit_dir = base.join(paths::SYSTEMD_SYSTEM_DIR.trim_start_matches('/'));
+    let service_unit = base.join(paths::GUARD_SERVICE_UNIT.trim_start_matches('/'));
+    let modules_disabled = base.join(paths::PROC_MODULES_DISABLED.trim_start_matches('/'));
+    Ok(GuardEnv {
+        binary_path,
+        state_root,
+        unit_dir,
+        service_unit,
+        modules_disabled,
+    })
+}
+
+fn dispatch_guard_install(root: Option<&Path>) -> i32 {
+    let env = match guard_env(root) {
+        Ok(e) => e,
+        Err(code) => return code,
+    };
+    // The guard service runs `seshat lock --yes` with SESHAT_STATE_ROOT=/var/lib/seshat baked in,
+    // so the state root we pass to the unit generator is always the system state root.
+    let system_state_root = match root {
+        Some(r) => r.join("var/lib/seshat"),
+        None => PathBuf::from("/var/lib/seshat"),
+    };
+    let inputs = guard::GuardInputs {
+        binary_path: &env.binary_path,
+        state_root: &system_state_root,
+        unit_dir: &env.unit_dir,
+        service_unit: &env.service_unit,
+    };
+    match guard::install_guard(&inputs, system_runner(root)) {
+        Ok(()) => {
+            println!("guard: installed kernel-hardening-guard.service");
+            println!("guard: state_root={}", system_state_root.display());
+            println!("guard: enabled for next boot (WantedBy=multi-user.target)");
+            0
+        }
+        Err(e) => print_error_exit(&e, system_service_exit_code(&e)),
+    }
+}
+
+fn dispatch_guard_remove(root: Option<&Path>) -> i32 {
+    let env = match guard_env(root) {
+        Ok(e) => e,
+        Err(code) => return code,
+    };
+    let inputs = guard::GuardInputs {
+        binary_path: &env.binary_path,
+        state_root: &env.state_root,
+        unit_dir: &env.unit_dir,
+        service_unit: &env.service_unit,
+    };
+    match guard::remove_guard(&inputs, system_runner(root)) {
+        Ok(summary) => {
+            println!("guard: removed service={}", summary.service_removed);
+            0
+        }
+        Err(e) => print_error_exit(&e, system_service_exit_code(&e)),
+    }
+}
+
+fn dispatch_guard_status(root: Option<&Path>) -> i32 {
+    let env = match guard_env(root) {
+        Ok(e) => e,
+        Err(code) => return code,
+    };
+    let inputs = guard::GuardInputs {
+        binary_path: &env.binary_path,
+        state_root: &env.state_root,
+        unit_dir: &env.unit_dir,
+        service_unit: &env.service_unit,
+    };
+    let status = guard::query_guard_status(&inputs, &env.modules_disabled, system_runner(root));
+    output::log("boot guard");
+    if !status.service_installed {
+        output::skip("guard: not installed (run: seshat guard install)");
+    } else if status.service_enabled {
+        output::ok("guard: installed and enabled");
+    } else {
+        output::warn("guard: installed but not enabled");
+    }
+    match status.modules_disabled {
+        Some(1) => output::ok("modules_disabled: 1 (locked)"),
+        Some(0) => output::warn("modules_disabled: 0 (unlocked)"),
+        Some(other) => output::warn(&format!("modules_disabled: {other} (unexpected)")),
+        None => output::skip("modules_disabled: unreadable"),
+    }
+    0
 }
 
 // Stub under --root; on bare host reads /proc/self/status Uid effective field.

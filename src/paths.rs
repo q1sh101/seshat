@@ -46,6 +46,15 @@ pub const GRUB_CONFIG: &str = "/etc/default/grub";
 pub const GRUB_CFG: &str = "/boot/grub/grub.cfg";
 pub const KERNEL_CMDLINE: &str = "/etc/kernel/cmdline";
 
+pub const WATCH_UNIT_STEM: &str = "kernel-hardening-watch";
+pub const SYSTEMD_SYSTEM_DIR: &str = "/etc/systemd/system";
+pub const WATCH_SERVICE_UNIT: &str = "/etc/systemd/system/kernel-hardening-watch.service";
+pub const WATCH_PATH_UNIT: &str = "/etc/systemd/system/kernel-hardening-watch.path";
+pub const WATCH_TIMER_UNIT: &str = "/etc/systemd/system/kernel-hardening-watch.timer";
+
+pub const GUARD_UNIT_STEM: &str = "kernel-hardening-guard";
+pub const GUARD_SERVICE_UNIT: &str = "/etc/systemd/system/kernel-hardening-guard.service";
+
 pub const PROC_SYS: &str = "/proc/sys";
 pub const PROC_CMDLINE: &str = "/proc/cmdline";
 pub const PROC_MODULES_DISABLED: &str = "/proc/sys/kernel/modules_disabled";
@@ -266,6 +275,11 @@ mod tests {
             GRUB_CONFIG,
             GRUB_CFG,
             KERNEL_CMDLINE,
+            SYSTEMD_SYSTEM_DIR,
+            WATCH_SERVICE_UNIT,
+            WATCH_PATH_UNIT,
+            WATCH_TIMER_UNIT,
+            GUARD_SERVICE_UNIT,
         ] {
             assert!(
                 Path::new(p).is_absolute(),

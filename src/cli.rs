@@ -36,12 +36,12 @@ pub enum ModulesCmd {
     List { profile: Option<String> },
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum WatchCmd {
-    Install,
+    Install { profile: Option<String> },
     Remove,
     Status,
-    Run,
+    Run { profile: Option<String> },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -286,15 +286,44 @@ fn parse_watch(args: &[String]) -> Result<Command, String> {
     let sub = args
         .first()
         .ok_or_else(|| "watch requires a subcommand: install|remove|status|run".to_string())?;
-    refuse_extras(&args[1..], "watch")?;
+    let rest = &args[1..];
     let cmd = match sub.as_str() {
-        "install" => WatchCmd::Install,
-        "remove" => WatchCmd::Remove,
-        "status" => WatchCmd::Status,
-        "run" => WatchCmd::Run,
+        "install" => WatchCmd::Install {
+            profile: parse_optional_profile(rest, "watch install")?,
+        },
+        "run" => WatchCmd::Run {
+            profile: parse_optional_profile(rest, "watch run")?,
+        },
+        "remove" => {
+            refuse_extras(rest, "watch remove")?;
+            WatchCmd::Remove
+        }
+        "status" => {
+            refuse_extras(rest, "watch status")?;
+            WatchCmd::Status
+        }
         other => return Err(format!("unknown watch subcommand: {other}")),
     };
     Ok(Command::Watch(cmd))
+}
+
+// `--profile NAME` with no positional args; anything else rejected.
+fn parse_optional_profile(args: &[String], where_: &str) -> Result<Option<String>, String> {
+    let mut profile: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--profile" => {
+                profile = Some(take_value(args, i, "--profile")?);
+                i += 2;
+            }
+            other if other.starts_with("--") => {
+                return Err(format!("unknown option for {where_}: {other}"));
+            }
+            other => return Err(format!("extra argument for {where_}: {other}")),
+        }
+    }
+    Ok(profile)
 }
 
 fn parse_guard(args: &[String]) -> Result<Command, String> {
@@ -535,12 +564,47 @@ mod tests {
     fn watch_subcommands_parse() {
         assert_eq!(
             parse(&argv(&["watch", "install"])).unwrap(),
-            Command::Watch(WatchCmd::Install)
+            Command::Watch(WatchCmd::Install { profile: None })
+        );
+        assert_eq!(
+            parse(&argv(&["watch", "install", "--profile", "baseline"])).unwrap(),
+            Command::Watch(WatchCmd::Install {
+                profile: Some("baseline".to_string())
+            })
         );
         assert_eq!(
             parse(&argv(&["watch", "run"])).unwrap(),
-            Command::Watch(WatchCmd::Run)
+            Command::Watch(WatchCmd::Run { profile: None })
         );
+        assert_eq!(
+            parse(&argv(&["watch", "run", "--profile", "strict"])).unwrap(),
+            Command::Watch(WatchCmd::Run {
+                profile: Some("strict".to_string())
+            })
+        );
+        assert_eq!(
+            parse(&argv(&["watch", "remove"])).unwrap(),
+            Command::Watch(WatchCmd::Remove)
+        );
+        assert_eq!(
+            parse(&argv(&["watch", "status"])).unwrap(),
+            Command::Watch(WatchCmd::Status)
+        );
+    }
+
+    #[test]
+    fn watch_install_rejects_unknown_flag() {
+        assert!(parse(&argv(&["watch", "install", "--bogus"])).is_err());
+    }
+
+    #[test]
+    fn watch_install_rejects_positional_after_profile() {
+        assert!(parse(&argv(&["watch", "install", "baseline"])).is_err());
+    }
+
+    #[test]
+    fn watch_remove_rejects_extra_args() {
+        assert!(parse(&argv(&["watch", "remove", "--profile", "x"])).is_err());
     }
 
     #[test]
