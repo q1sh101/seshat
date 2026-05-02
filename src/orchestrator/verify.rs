@@ -170,7 +170,6 @@ mod tests {
     use super::*;
     use crate::policy::{BootEntry, LockdownSection, ModulesSection, SysctlEntry};
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use tempfile::tempdir;
 
@@ -260,23 +259,10 @@ mod tests {
         }
     }
 
-    fn write_mode_0o600(path: &Path, body: &str) {
-        fs::write(path, body).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
-    }
-
     fn seed_proc_sys(env: &Env, key_path: &str, value: &str) {
         let full = env.proc_sys_root.join(key_path);
         fs::create_dir_all(full.parent().unwrap()).unwrap();
         fs::write(full, value).unwrap();
-    }
-
-    fn seed_installed_modules(env: &Env, names: &[&str]) {
-        let kernel_dir = env.modules_dir.join("kernel");
-        fs::create_dir_all(&kernel_dir).unwrap();
-        for n in names {
-            fs::write(kernel_dir.join(format!("{n}.ko")), "").unwrap();
-        }
     }
 
     #[test]

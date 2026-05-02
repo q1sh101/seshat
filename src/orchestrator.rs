@@ -9,20 +9,15 @@ mod verify;
 
 pub(crate) use deploy::deploy_boot_domain;
 pub use deploy::{
-    BootDeployMode, BootDeployStatus, BootDeploySummary, BootSkipReason, DeployInputs,
-    DeployReport, classify_deploy_error, orchestrate_deploy,
+    BootDeployStatus, DeployInputs, DeployReport, classify_deploy_error, orchestrate_deploy,
 };
 pub use lock::{LockInputs, LockReport, classify_lock_error, orchestrate_lock};
 pub use plan::{PlanInputs, PlanReport, orchestrate_plan};
 pub use rollback::{
-    RollbackDomain, RollbackInputs, RollbackOutcome, RollbackReport, classify_rollback_error,
-    orchestrate_rollback,
+    RollbackDomain, RollbackInputs, RollbackOutcome, classify_rollback_error, orchestrate_rollback,
 };
-pub use status::{
-    BootStatus, DriftState, LockStatus, ModulesStatus, StatusInputs, StatusReport, SysctlStatus,
-    fingerprint, orchestrate_status,
-};
-pub use verify::{LockdownRow, VerifyInputs, VerifyReport, orchestrate_verify};
+pub use status::{DriftState, StatusInputs, StatusReport, orchestrate_status};
+pub use verify::{VerifyInputs, VerifyReport, orchestrate_verify};
 
 #[cfg(test)]
 mod cross_domain_lock_tests {
