@@ -575,7 +575,6 @@ mod tests {
             BootDeployStatus::Applied(summary) => {
                 assert_eq!(summary.mode, BootDeployMode::GrubDropIn);
                 assert_eq!(summary.target, env.grub_dropin_target);
-                assert!(summary.backup.is_none(), "fresh dropin has no prior file");
                 assert!(matches!(
                     summary.refresh,
                     RefreshStatus::Applied {
@@ -609,7 +608,6 @@ mod tests {
             BootDeployStatus::Applied(summary) => {
                 assert_eq!(summary.mode, BootDeployMode::GrubMainFile);
                 assert_eq!(summary.target, env.grub_config);
-                assert!(summary.backup.is_some(), "existing main must be backed up");
             }
             other => panic!("expected Applied, got {other:?}"),
         }

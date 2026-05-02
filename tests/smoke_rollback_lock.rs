@@ -92,17 +92,18 @@ fn seed_modprobe_backup(root: &Path) -> PathBuf {
 }
 
 #[test]
-fn rollback_boot_exits_three_and_writes_nothing() {
+fn rollback_boot_without_backup_reports_nothing_to_rollback() {
+    // Boot-only rollback should skip cleanly when no boot backup exists.
     let tmp = seed_fake_root();
     let root = tmp.path().to_str().unwrap();
-    let (code, _, stderr) = run(&["--root", root, "rollback", "--yes", "boot"]);
-    assert_eq!(code, 3);
+    let (code, stdout, stderr) = run(&["--root", root, "rollback", "--yes", "boot"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let combined = format!("{stdout}{stderr}");
     assert!(
-        stderr.contains("boot rollback not implemented"),
-        "stderr: {stderr}"
+        combined.contains("nothing to rollback"),
+        "combined: {combined}"
     );
-    // Boot refusal must not create lock_root or touch any domain tree.
-    assert!(!tmp.path().join("run/seshat-locks").exists());
+    // Boot-only rollback must not create sysctl or modprobe trees.
     assert!(!tmp.path().join("etc/sysctl.d").exists());
     assert!(!tmp.path().join("etc/modprobe.d").exists());
 }
@@ -375,4 +376,150 @@ fn lock_parse_level_root_discipline_still_enforced() {
         stderr.contains("filesystem root") || stderr.contains("filesystem-root"),
         "stderr: {stderr}"
     );
+}
+
+fn seed_boot_dropin_backup(root: &Path) -> PathBuf {
+    let dir = backup_dir(root, "boot");
+    fs::create_dir_all(&dir).unwrap();
+    let backup = dir.join("99-kernel-hardening.cfg.10.000000020.30.bak");
+    fs::write(
+        &backup,
+        "# managed by seshat\nGRUB_CMDLINE_LINUX_DEFAULT=\"prior\"\n",
+    )
+    .unwrap();
+    backup
+}
+
+fn seed_boot_main_backup(root: &Path) -> PathBuf {
+    let dir = backup_dir(root, "boot");
+    fs::create_dir_all(&dir).unwrap();
+    let backup = dir.join("grub.10.000000020.30.bak");
+    fs::write(&backup, "GRUB_CMDLINE_LINUX_DEFAULT=\"original\"\n").unwrap();
+    backup
+}
+
+#[test]
+fn rollback_all_boot_reports_nothing_to_rollback_when_no_boot_backups() {
+    let tmp = seed_fake_root();
+    let root = tmp.path().to_str().unwrap();
+    // sysctl+modules backups seeded so orchestrator reaches boot branch cleanly.
+    seed_sysctl_backup(tmp.path());
+    seed_modprobe_backup(tmp.path());
+    let (code, stdout, stderr) = run(&["--root", root, "rollback", "--yes", "all"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains("rollback boot: nothing to rollback"),
+        "stdout: {stdout}"
+    );
+    assert!(!stdout.contains("reboot required for grub"));
+}
+
+#[test]
+fn rollback_all_boot_restores_dropin_from_backup_and_warns_about_reboot() {
+    let tmp = seed_fake_root();
+    let root = tmp.path().to_str().unwrap();
+    seed_sysctl_backup(tmp.path());
+    seed_modprobe_backup(tmp.path());
+    let backup = seed_boot_dropin_backup(tmp.path());
+    let (code, stdout, stderr) = run(&["--root", root, "rollback", "--yes", "all"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains("rollback boot: restored"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stderr.contains("reboot required for grub"),
+        "boot reboot warning missing: {stderr}"
+    );
+    let dropin = tmp
+        .path()
+        .join("etc/default/grub.d/99-kernel-hardening.cfg");
+    assert!(dropin.exists(), "dropin not restored");
+    assert_eq!(
+        fs::read_to_string(&dropin).unwrap(),
+        fs::read_to_string(&backup).unwrap()
+    );
+}
+
+#[test]
+fn rollback_all_boot_removes_managed_dropin_when_no_backup_exists() {
+    let tmp = seed_fake_root();
+    let root = tmp.path().to_str().unwrap();
+    seed_sysctl_backup(tmp.path());
+    seed_modprobe_backup(tmp.path());
+    // Simulate a prior deploy: managed drop-in exists, no backup.
+    let dropin = tmp
+        .path()
+        .join("etc/default/grub.d/99-kernel-hardening.cfg");
+    fs::write(&dropin, "# stale managed\n").unwrap();
+    let (code, stdout, stderr) = run(&["--root", root, "rollback", "--yes", "all"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains("rollback boot: removed"),
+        "stdout: {stdout}"
+    );
+    assert!(stderr.contains("reboot required for grub"));
+    assert!(!dropin.exists(), "managed dropin should have been removed");
+}
+
+#[test]
+fn rollback_all_boot_restores_main_from_backup_when_no_dropin_backup_or_target() {
+    let tmp = seed_fake_root();
+    let root = tmp.path().to_str().unwrap();
+    seed_sysctl_backup(tmp.path());
+    seed_modprobe_backup(tmp.path());
+    let backup = seed_boot_main_backup(tmp.path());
+    let (code, stdout, stderr) = run(&["--root", root, "rollback", "--yes", "all"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains("rollback boot: restored"),
+        "stdout: {stdout}"
+    );
+    let main = tmp.path().join("etc/default/grub");
+    assert_eq!(
+        fs::read_to_string(&main).unwrap(),
+        fs::read_to_string(&backup).unwrap()
+    );
+}
+
+#[test]
+fn rollback_all_refuses_symlinked_boot_backup_dir() {
+    let tmp = seed_fake_root();
+    let root = tmp.path().to_str().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let profiles = tmp.path().join("var/lib/seshat/profiles");
+    fs::create_dir_all(&profiles).unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), profiles.join("backups-boot")).unwrap();
+    let (code, _, stderr) = run(&["--root", root, "rollback", "--yes", "all"]);
+    assert_eq!(code, 3, "stderr: {stderr}");
+    assert!(stderr.contains("symlink"), "stderr: {stderr}");
+    assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn rollback_all_refuses_symlinked_grub_config_d() {
+    let tmp = seed_fake_root();
+    let root = tmp.path().to_str().unwrap();
+    let grub_d = tmp.path().join("etc/default/grub.d");
+    fs::remove_dir_all(&grub_d).unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), &grub_d).unwrap();
+    let (code, _, stderr) = run(&["--root", root, "rollback", "--yes", "all"]);
+    assert_eq!(code, 3, "stderr: {stderr}");
+    assert!(stderr.contains("symlink"), "stderr: {stderr}");
+    assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn rollback_all_refuses_symlinked_grub_config_parent() {
+    let tmp = seed_fake_root();
+    let root = tmp.path().to_str().unwrap();
+    let etc_default = tmp.path().join("etc/default");
+    fs::remove_dir_all(&etc_default).unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), &etc_default).unwrap();
+    let (code, _, stderr) = run(&["--root", root, "rollback", "--yes", "all"]);
+    assert_eq!(code, 3, "stderr: {stderr}");
+    assert!(stderr.contains("symlink"), "stderr: {stderr}");
+    assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 0);
 }

@@ -15,8 +15,8 @@ pub use deploy::{
 pub use lock::{LockInputs, LockReport, classify_lock_error, orchestrate_lock};
 pub use plan::{PlanInputs, PlanReport, orchestrate_plan};
 pub use rollback::{
-    BOOT_ROLLBACK_REFUSED, RollbackDomain, RollbackInputs, RollbackOutcome, RollbackReport,
-    classify_rollback_error, orchestrate_rollback,
+    RollbackDomain, RollbackInputs, RollbackOutcome, RollbackReport, classify_rollback_error,
+    orchestrate_rollback,
 };
 pub use status::{
     BootStatus, DriftState, LockStatus, ModulesStatus, StatusInputs, StatusReport, SysctlStatus,
@@ -184,6 +184,7 @@ mod cross_domain_lock_tests {
         let result = orchestrate_rollback(
             &rollback_inputs(&env.lock_root),
             || true,
+            ok_outcome,
             ok_outcome,
             ok_outcome,
         );

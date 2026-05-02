@@ -5,9 +5,6 @@ use crate::lock;
 
 use super::OPERATION_LOCK_NAME;
 
-pub const BOOT_ROLLBACK_REFUSED: &str =
-    "boot rollback not implemented in this build; Milestone 2 covers GRUB rollback";
-
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum RollbackDomain {
     All,
@@ -26,6 +23,7 @@ pub struct RollbackReport {
     pub aborted: bool,
     pub sysctl: Option<Result<RollbackOutcome, Error>>,
     pub modules: Option<Result<RollbackOutcome, Error>>,
+    pub boot: Option<Result<RollbackOutcome, Error>>,
 }
 
 impl RollbackReport {
@@ -45,7 +43,13 @@ impl RollbackReport {
             .and_then(|r| r.as_ref().err())
             .map(classify_rollback_error)
             .unwrap_or(0);
-        sysctl_code.max(modules_code)
+        let boot_code = self
+            .boot
+            .as_ref()
+            .and_then(|r| r.as_ref().err())
+            .map(classify_rollback_error)
+            .unwrap_or(0);
+        sysctl_code.max(modules_code).max(boot_code)
     }
 }
 
@@ -65,16 +69,18 @@ pub struct RollbackInputs<'a> {
     pub lock_root: &'a Path,
 }
 
-pub fn orchestrate_rollback<F, R, M>(
+pub fn orchestrate_rollback<F, R, M, B>(
     inputs: &RollbackInputs<'_>,
     confirm_prompt: F,
     restore_sysctl: R,
     restore_modules: M,
+    restore_boot: B,
 ) -> Result<RollbackReport, Error>
 where
     F: FnOnce() -> bool,
     R: FnOnce() -> Result<RollbackOutcome, Error>,
     M: FnOnce() -> Result<RollbackOutcome, Error>,
+    B: FnOnce() -> Result<RollbackOutcome, Error>,
 {
     // Interactive decline is a clean abort (exit 0), not a domain failure.
     if let Authorization::Declined = authorize(inputs, confirm_prompt)? {
@@ -82,18 +88,12 @@ where
             aborted: true,
             sysctl: None,
             modules: None,
-        });
-    }
-    // Boot rollback is Milestone 2 territory: refuse before lock/restore.
-    if matches!(inputs.domain, RollbackDomain::Boot) {
-        return Err(Error::PreflightRefused {
-            path: PathBuf::from("boot"),
-            reason: BOOT_ROLLBACK_REFUSED.to_string(),
+            boot: None,
         });
     }
     let _guard = lock::acquire(inputs.lock_root, OPERATION_LOCK_NAME)?;
     pause_watcher();
-    let report = dispatch(inputs.domain, restore_sysctl, restore_modules);
+    let report = dispatch(inputs.domain, restore_sysctl, restore_modules, restore_boot);
     resume_watcher();
     Ok(report)
 }
@@ -123,28 +123,42 @@ where
     }
 }
 
-fn dispatch<R, M>(domain: RollbackDomain, restore_sysctl: R, restore_modules: M) -> RollbackReport
+fn dispatch<R, M, B>(
+    domain: RollbackDomain,
+    restore_sysctl: R,
+    restore_modules: M,
+    restore_boot: B,
+) -> RollbackReport
 where
     R: FnOnce() -> Result<RollbackOutcome, Error>,
     M: FnOnce() -> Result<RollbackOutcome, Error>,
+    B: FnOnce() -> Result<RollbackOutcome, Error>,
 {
     match domain {
         RollbackDomain::All => RollbackReport {
             aborted: false,
             sysctl: Some(restore_sysctl()),
             modules: Some(restore_modules()),
+            boot: Some(restore_boot()),
         },
         RollbackDomain::Sysctl => RollbackReport {
             aborted: false,
             sysctl: Some(restore_sysctl()),
             modules: None,
+            boot: None,
         },
         RollbackDomain::Modules => RollbackReport {
             aborted: false,
             sysctl: None,
             modules: Some(restore_modules()),
+            boot: None,
         },
-        RollbackDomain::Boot => unreachable!("RollbackDomain::Boot is refused before dispatch"),
+        RollbackDomain::Boot => RollbackReport {
+            aborted: false,
+            sysctl: None,
+            modules: None,
+            boot: Some(restore_boot()),
+        },
     }
 }
 
@@ -205,6 +219,22 @@ mod tests {
         })
     }
 
+    fn boot_ok() -> Result<RollbackOutcome, Error> {
+        Ok(RollbackOutcome {
+            restored_from: Some(PathBuf::from("/backups/boot/latest")),
+        })
+    }
+
+    fn boot_nothing() -> Result<RollbackOutcome, Error> {
+        Ok(RollbackOutcome {
+            restored_from: None,
+        })
+    }
+
+    fn panic_boot() -> Result<RollbackOutcome, Error> {
+        panic!("boot restore must not run in this scenario");
+    }
+
     fn domain_err(field: &str) -> Result<RollbackOutcome, Error> {
         Err(Error::Validation {
             field: field.to_string(),
@@ -220,10 +250,12 @@ mod tests {
             never_called,
             sysctl_ok,
             modules_ok,
+            panic_boot,
         )
         .unwrap();
         assert!(report.sysctl.is_some());
         assert!(report.modules.is_none());
+        assert!(report.boot.is_none());
     }
 
     #[test]
@@ -234,6 +266,7 @@ mod tests {
             never_called,
             sysctl_ok,
             modules_ok,
+            boot_ok,
         )
         .unwrap_err();
         match err {
@@ -254,6 +287,7 @@ mod tests {
             || true,
             sysctl_ok,
             modules_ok,
+            panic_boot,
         )
         .unwrap();
         assert!(report.sysctl.is_some());
@@ -267,11 +301,13 @@ mod tests {
             || false,
             sysctl_ok,
             modules_ok,
+            panic_boot,
         )
         .unwrap();
         assert!(report.aborted);
         assert!(report.sysctl.is_none());
         assert!(report.modules.is_none());
+        assert!(report.boot.is_none());
         assert_eq!(report.exit_code(), 0);
     }
 
@@ -285,6 +321,7 @@ mod tests {
             || false,
             || panic!("sysctl restore must not run when operator declines"),
             || panic!("modules restore must not run when operator declines"),
+            || panic!("boot restore must not run when operator declines"),
         )
         .unwrap();
         assert!(report.aborted);
@@ -292,19 +329,22 @@ mod tests {
     }
 
     #[test]
-    fn all_domain_dispatches_only_sysctl_and_modules_in_milestone_one() {
+    fn all_domain_dispatches_sysctl_modules_and_boot() {
         let env = env();
         let report = orchestrate_rollback(
             &inputs(&env, RollbackDomain::All, true, false),
             never_called,
             sysctl_ok,
             modules_ok,
+            boot_ok,
         )
         .unwrap();
         assert!(report.sysctl.is_some());
         assert!(report.modules.is_some());
+        assert!(report.boot.is_some());
         assert!(report.sysctl.as_ref().unwrap().is_ok());
         assert!(report.modules.as_ref().unwrap().is_ok());
+        assert!(report.boot.as_ref().unwrap().is_ok());
     }
 
     #[test]
@@ -315,10 +355,12 @@ mod tests {
             never_called,
             sysctl_ok,
             modules_ok,
+            panic_boot,
         )
         .unwrap();
         assert!(report.sysctl.is_some());
         assert!(report.modules.is_none());
+        assert!(report.boot.is_none());
     }
 
     #[test]
@@ -329,43 +371,46 @@ mod tests {
             never_called,
             sysctl_ok,
             modules_ok,
+            panic_boot,
         )
         .unwrap();
         assert!(report.sysctl.is_none());
         assert!(report.modules.is_some());
+        assert!(report.boot.is_none());
     }
 
     #[test]
-    fn boot_domain_refuses_with_preflight_and_exit_three() {
+    fn boot_domain_dispatches_only_boot() {
         let env = env();
-        let result = orchestrate_rollback(
+        let report = orchestrate_rollback(
+            &inputs(&env, RollbackDomain::Boot, true, false),
+            never_called,
+            || panic!("sysctl restore must not run for boot-only"),
+            || panic!("modules restore must not run for boot-only"),
+            boot_ok,
+        )
+        .unwrap();
+        assert!(report.sysctl.is_none());
+        assert!(report.modules.is_none());
+        assert!(report.boot.is_some());
+    }
+
+    #[test]
+    fn boot_domain_reports_nothing_to_rollback_as_ok_none() {
+        let env = env();
+        let report = orchestrate_rollback(
             &inputs(&env, RollbackDomain::Boot, true, false),
             never_called,
             sysctl_ok,
             modules_ok,
-        );
-        let err = match result {
-            Err(ref e @ Error::PreflightRefused { ref reason, .. }) => {
-                assert_eq!(reason, BOOT_ROLLBACK_REFUSED);
-                e
-            }
-            other => panic!("expected PreflightRefused, got {other:?}"),
-        };
-        assert_eq!(classify_rollback_error(err), 3);
-    }
-
-    #[test]
-    fn boot_domain_refuses_before_taking_lock_or_running_restore() {
-        let env = env();
-        // Holder would turn a lock-acquiring path into Err(Lock); refusal must beat that.
-        let _holder = lock::acquire(&env.lock_root, OPERATION_LOCK_NAME).unwrap();
-        let result = orchestrate_rollback(
-            &inputs(&env, RollbackDomain::Boot, true, false),
-            never_called,
-            || panic!("sysctl restore must not run for boot refusal"),
-            || panic!("modules restore must not run for boot refusal"),
-        );
-        assert!(matches!(result, Err(Error::PreflightRefused { .. })));
+            boot_nothing,
+        )
+        .unwrap();
+        match &report.boot {
+            Some(Ok(outcome)) => assert!(outcome.restored_from.is_none()),
+            other => panic!("expected Ok(None restored_from), got {other:?}"),
+        }
+        assert_eq!(report.exit_code(), 0);
     }
 
     #[test]
@@ -377,6 +422,7 @@ mod tests {
             never_called,
             sysctl_ok,
             modules_ok,
+            panic_boot,
         );
         assert!(matches!(result, Err(Error::Lock { .. })));
     }
@@ -388,12 +434,9 @@ mod tests {
         let _ = orchestrate_rollback(
             &inputs(&env, RollbackDomain::All, true, false),
             never_called,
-            || {
-                panic!("sysctl restore must not run when lock is contended");
-            },
-            || {
-                panic!("modules restore must not run when lock is contended");
-            },
+            || panic!("sysctl restore must not run when lock is contended"),
+            || panic!("modules restore must not run when lock is contended"),
+            || panic!("boot restore must not run when lock is contended"),
         );
     }
 
@@ -405,6 +448,7 @@ mod tests {
             never_called,
             sysctl_ok,
             modules_ok,
+            boot_ok,
         )
         .unwrap();
         assert_eq!(report.exit_code(), 0);
@@ -418,9 +462,25 @@ mod tests {
             never_called,
             || domain_err("rollback.sysctl"),
             modules_ok,
+            panic_boot,
         )
         .unwrap();
         assert_eq!(report.exit_code(), 1);
+    }
+
+    #[test]
+    fn exit_code_one_when_boot_restore_errors() {
+        let env = env();
+        let report = orchestrate_rollback(
+            &inputs(&env, RollbackDomain::Boot, true, false),
+            never_called,
+            sysctl_ok,
+            modules_ok,
+            || domain_err("rollback.boot"),
+        )
+        .unwrap();
+        assert_eq!(report.exit_code(), 1);
+        assert!(report.boot.as_ref().unwrap().is_err());
     }
 
     #[test]
@@ -436,6 +496,26 @@ mod tests {
                 })
             },
             modules_ok,
+            panic_boot,
+        )
+        .unwrap();
+        assert_eq!(report.exit_code(), 3);
+    }
+
+    #[test]
+    fn exit_code_three_when_unsafe_path_in_boot_restore() {
+        let env = env();
+        let report = orchestrate_rollback(
+            &inputs(&env, RollbackDomain::Boot, true, false),
+            never_called,
+            sysctl_ok,
+            modules_ok,
+            || {
+                Err(Error::UnsafePath {
+                    path: PathBuf::from("/x"),
+                    reason: "symlink".to_string(),
+                })
+            },
         )
         .unwrap();
         assert_eq!(report.exit_code(), 3);
@@ -450,6 +530,7 @@ mod tests {
             never_called,
             sysctl_ok,
             modules_ok,
+            panic_boot,
         )
         .unwrap_err();
         assert_eq!(classify_rollback_error(&err), 3);

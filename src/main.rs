@@ -20,14 +20,15 @@ use std::io::IsTerminal;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use boot::{BootRestore, RefreshStatus};
 use cli::{Command, Domain, ModulesCmd, SnapshotCmd};
 use error::Error;
 use modules::{ModulesLockOutcome, ModulesRestore, PendingReport};
 use orchestrator::{
-    BOOT_ROLLBACK_REFUSED, DeployInputs, LockInputs, LockReport, PlanInputs, RollbackDomain,
-    RollbackInputs, RollbackOutcome, StatusInputs, VerifyInputs, classify_deploy_error,
-    orchestrate_deploy, orchestrate_lock, orchestrate_plan, orchestrate_rollback,
-    orchestrate_status, orchestrate_verify,
+    DeployInputs, LockInputs, LockReport, PlanInputs, RollbackDomain, RollbackInputs,
+    RollbackOutcome, StatusInputs, VerifyInputs, classify_deploy_error, orchestrate_deploy,
+    orchestrate_lock, orchestrate_plan, orchestrate_rollback, orchestrate_status,
+    orchestrate_verify,
 };
 use paths::ensure_dir;
 use policy::{ModuleName, Profile, ProfileName};
@@ -1011,14 +1012,6 @@ fn matches_domain(selected: Domain, target: Domain) -> bool {
 }
 
 fn dispatch_rollback(yes: bool, domain: Domain, root: Option<&Path>) -> i32 {
-    // Boot refusal BEFORE any filesystem mutation.
-    if matches!(domain, Domain::Boot) {
-        output::fail(&format!(
-            "preflight refused for boot: {BOOT_ROLLBACK_REFUSED}"
-        ));
-        return 3;
-    }
-
     let paths = match cli_paths(root) {
         Ok(p) => p,
         Err(e) => return print_error_exit(&e, 1),
@@ -1067,6 +1060,20 @@ fn dispatch_rollback(yes: bool, domain: Domain, root: Option<&Path>) -> i32 {
             Err(e) => return print_error_exit(&e, 1),
         }
     }
+    // Boot write dirs (operator-owned); refuse symlink/non-dir but do not auto-create.
+    if matches!(domain, Domain::All) {
+        if let Err(e) = refuse_unsafe_dir_if_exists(&paths.boot_backup_dir) {
+            return print_error_exit(&e, 1);
+        }
+        if let Err(e) = refuse_unsafe_dir_if_exists(&paths.grub_config_d) {
+            return print_error_exit(&e, 1);
+        }
+        if let Some(parent) = paths.grub_config.parent()
+            && let Err(e) = refuse_unsafe_dir_if_exists(parent)
+        {
+            return print_error_exit(&e, 1);
+        }
+    }
 
     let inputs = RollbackInputs {
         domain: to_rollback_domain(domain),
@@ -1107,9 +1114,50 @@ fn dispatch_rollback(yes: bool, domain: Domain, root: Option<&Path>) -> i32 {
         Ok(RollbackOutcome { restored_from })
     };
 
+    let boot_capture: RefCell<Option<BootRestore>> = RefCell::new(None);
+    let boot_refresh_capture: RefCell<Option<RefreshStatus>> = RefCell::new(None);
+    let grub_dropin_target = paths.grub_dropin_target.clone();
+    let grub_config = paths.grub_config.clone();
+    let grub_cfg = paths.grub_cfg.clone();
+    let boot_backup_dir = paths.boot_backup_dir.clone();
+    let root_for_boot = root.map(|r| r.to_path_buf());
+    let boot_restore = || -> Result<RollbackOutcome, Error> {
+        // Try drop-in first (allow_remove=true); fall back to main-file (allow_remove=false) when no dropin backup/target.
+        let dropin_outcome =
+            boot::restore_boot_from_backup(&grub_dropin_target, &boot_backup_dir, true)?;
+        let (outcome, changed) = match dropin_outcome {
+            BootRestore::NothingToRollback => {
+                let main_outcome =
+                    boot::restore_boot_from_backup(&grub_config, &boot_backup_dir, false)?;
+                let changed = !matches!(main_outcome, BootRestore::NothingToRollback);
+                (main_outcome, changed)
+            }
+            other => (other, true),
+        };
+        let restored_from = match &outcome {
+            BootRestore::Restored { from } => Some(from.clone()),
+            _ => None,
+        };
+        *boot_capture.borrow_mut() = Some(outcome);
+        if changed {
+            // Regenerate grub.cfg so the restored source config reaches the boot loader on next reboot.
+            let has_command = has_command_probe(root_for_boot.as_deref());
+            let runner = boot_runner_closure(root_for_boot.as_deref());
+            let status = boot::refresh_grub_configuration(&grub_cfg, &has_command, runner);
+            *boot_refresh_capture.borrow_mut() = Some(status);
+        }
+        Ok(RollbackOutcome { restored_from })
+    };
+
     // yes=true bypass; prompt is unreachable but the closure must still type-check.
     let confirm = || true;
-    match orchestrate_rollback(&inputs, confirm, sysctl_restore, modules_restore) {
+    match orchestrate_rollback(
+        &inputs,
+        confirm,
+        sysctl_restore,
+        modules_restore,
+        boot_restore,
+    ) {
         Ok(report) => {
             if report.aborted {
                 output::log("rollback: aborted");
@@ -1132,6 +1180,13 @@ fn dispatch_rollback(yes: bool, domain: Domain, root: Option<&Path>) -> i32 {
             if let Some(result) = &report.modules {
                 render_modules_rollback_outcome(result, modules_capture.into_inner().as_ref());
             }
+            if let Some(result) = &report.boot {
+                render_boot_rollback_outcome(
+                    result,
+                    boot_capture.into_inner().as_ref(),
+                    boot_refresh_capture.into_inner().as_ref(),
+                );
+            }
             let code = report.exit_code();
             if code == 0 {
                 output::log("verify with: seshat verify");
@@ -1142,6 +1197,38 @@ fn dispatch_rollback(yes: bool, domain: Domain, root: Option<&Path>) -> i32 {
             output::fail(&format!("{e}"));
             orchestrator::classify_rollback_error(&e)
         }
+    }
+}
+
+fn render_boot_rollback_outcome(
+    result: &Result<RollbackOutcome, Error>,
+    rich: Option<&BootRestore>,
+    refresh: Option<&RefreshStatus>,
+) {
+    match result {
+        Ok(_) => {
+            match rich {
+                Some(BootRestore::Restored { from }) => {
+                    output::ok(&format!("rollback boot: restored from {}", from.display()));
+                }
+                Some(BootRestore::Removed { target }) => {
+                    output::ok(&format!("rollback boot: removed {}", target.display()));
+                }
+                Some(BootRestore::NothingToRollback) | None => {
+                    output::skip("rollback boot: nothing to rollback");
+                }
+            }
+            if let Some(status) = refresh {
+                output::log(&format!("refresh={status:?}"));
+            }
+            // Grub source changes reach the bootloader only after reboot; refresh failure is separate and shown above.
+            if let Some(r) = rich
+                && r.reboot_required()
+            {
+                output::warn("reboot required for grub source changes");
+            }
+        }
+        Err(e) => output::fail(&format!("rollback boot: {e}")),
     }
 }
 
