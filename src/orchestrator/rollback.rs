@@ -54,12 +54,7 @@ impl RollbackReport {
 }
 
 pub fn classify_rollback_error(err: &Error) -> i32 {
-    match err {
-        Error::UnsafePath { .. }
-        | Error::PreflightRefused { .. }
-        | Error::Lock { .. } => 3,
-        _ => 1,
-    }
+    err.exit_code(1)
 }
 
 pub struct RollbackInputs<'a> {

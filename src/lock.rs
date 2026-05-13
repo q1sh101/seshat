@@ -34,11 +34,11 @@ pub(crate) fn current_uid() -> Result<u32, Error> {
     parse_uid_from_status(&fs::read_to_string("/proc/self/status")?)
 }
 
-fn sudo_uid() -> Option<u32> {
+pub(crate) fn sudo_uid() -> Option<u32> {
     std::env::var("SUDO_UID").ok()?.parse().ok()
 }
 
-fn uid_is_acceptable(file_uid: u32, current: u32, sudo: Option<u32>) -> bool {
+pub(crate) fn uid_is_acceptable(file_uid: u32, current: u32, sudo: Option<u32>) -> bool {
     if file_uid == 0 || file_uid == current {
         return true;
     }

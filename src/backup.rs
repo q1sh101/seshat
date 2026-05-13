@@ -85,10 +85,7 @@ pub fn create_backup(destination: &Path, backup_dir: &Path) -> Result<Option<Pat
     create_backup_with_clock(destination, backup_dir, secs, nanos, std::process::id())
 }
 
-pub fn latest_backup_for(
-    basename: &OsStr,
-    backup_dir: &Path,
-) -> Result<Option<PathBuf>, Error> {
+pub fn latest_backup_for(basename: &OsStr, backup_dir: &Path) -> Result<Option<PathBuf>, Error> {
     let entries = match fs::read_dir(backup_dir) {
         Ok(it) => it,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),

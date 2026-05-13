@@ -53,10 +53,7 @@ fn validated_absolute<'a>(path: &'a Path, field: &str) -> Result<&'a str, Error>
     Ok(s)
 }
 
-pub fn generate_path_unit(
-    sysctl_dropin: &Path,
-    modprobe_dropin: &Path,
-) -> Result<String, Error> {
+pub fn generate_path_unit(sysctl_dropin: &Path, modprobe_dropin: &Path) -> Result<String, Error> {
     let sysctl = path_str(sysctl_dropin, "sysctl_dropin")?;
     let modprobe = path_str(modprobe_dropin, "modprobe_dropin")?;
     Ok(format!(

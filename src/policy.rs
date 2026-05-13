@@ -6,7 +6,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
-use crate::lock::current_uid;
+use crate::lock::{current_uid, sudo_uid, uid_is_acceptable};
 
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -301,16 +301,6 @@ impl Profile {
 // TOCTOU boundary: compare opened-file metadata to preflight.
 fn same_inode(a: &fs::Metadata, b: &fs::Metadata) -> bool {
     a.dev() == b.dev() && a.ino() == b.ino()
-}
-
-// SUDO_UID exists only when the kernel raised our euid; accepting it keeps
-// `sudo seshat deploy` usable against a profile kept under the invoker's home.
-fn sudo_uid() -> Option<u32> {
-    std::env::var("SUDO_UID").ok()?.parse().ok()
-}
-
-fn uid_is_acceptable(file_uid: u32, current: u32, sudo: Option<u32>) -> bool {
-    file_uid == 0 || file_uid == current || sudo.is_some_and(|s| file_uid == s)
 }
 
 pub(crate) fn safe_policy_read(path: &Path) -> Result<String, Error> {

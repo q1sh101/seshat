@@ -1577,10 +1577,7 @@ fn system_runner(
 }
 
 fn system_service_exit_code(err: &Error) -> i32 {
-    match err {
-        Error::UnsafePath { .. } | Error::PreflightRefused { .. } => 3,
-        _ => 1,
-    }
+    err.exit_code(1)
 }
 
 fn dispatch_guard(sub: GuardCmd, root: Option<&Path>) -> i32 {
@@ -1606,7 +1603,7 @@ fn guard_env(root: Option<&Path>) -> Result<GuardEnv, i32> {
             Err(_) => p,
         },
         Err(e) => {
-            eprintln!("error: cannot resolve binary path: {e}");
+            output::fail(&format!("cannot resolve binary path: {e}"));
             return Err(1);
         }
     };
@@ -1615,7 +1612,7 @@ fn guard_env(root: Option<&Path>) -> Result<GuardEnv, i32> {
         None => match paths::state_root() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("error: {e}");
+                output::fail(&format!("{e}"));
                 return Err(1);
             }
         },
@@ -1655,9 +1652,9 @@ fn dispatch_guard_install(root: Option<&Path>) -> i32 {
     };
     match guard::install_guard(&inputs, system_runner(root)) {
         Ok(()) => {
-            println!("guard: installed kernel-hardening-guard.service");
-            println!("guard: state_root={}", system_state_root.display());
-            println!("guard: enabled for next boot (WantedBy=multi-user.target)");
+            output::ok("guard: installed kernel-hardening-guard.service");
+            output::log(&format!("state_root={}", system_state_root.display()));
+            output::log("enabled for next boot (WantedBy=multi-user.target)");
             0
         }
         Err(e) => print_error_exit(&e, system_service_exit_code(&e)),
@@ -1677,7 +1674,10 @@ fn dispatch_guard_remove(root: Option<&Path>) -> i32 {
     };
     match guard::remove_guard(&inputs, system_runner(root)) {
         Ok(summary) => {
-            println!("guard: removed service={}", summary.service_removed);
+            output::ok(&format!(
+                "guard: removed service={}",
+                summary.service_removed
+            ));
             0
         }
         Err(e) => print_error_exit(&e, system_service_exit_code(&e)),
@@ -1968,10 +1968,42 @@ fn ensure_lock_root(path: &Path) -> Result<(), Error> {
 
 fn print_error_exit(err: &Error, default_code: i32) -> i32 {
     output::fail(&format!("{err}"));
-    match err {
-        Error::UnsafePath { .. }
-        | Error::PreflightRefused { .. }
-        | Error::Lock { .. } => 3,
-        _ => default_code,
+    err.exit_code(default_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_service_exit_code_maps_security_variants_to_three() {
+        assert_eq!(
+            system_service_exit_code(&Error::UnsafePath {
+                path: PathBuf::from("/x"),
+                reason: String::new(),
+            }),
+            3
+        );
+        assert_eq!(
+            system_service_exit_code(&Error::PreflightRefused {
+                path: PathBuf::from("/x"),
+                reason: String::new(),
+            }),
+            3
+        );
+        assert_eq!(
+            system_service_exit_code(&Error::Lock {
+                path: PathBuf::from("/x"),
+                reason: String::new(),
+            }),
+            3
+        );
+        assert_eq!(
+            system_service_exit_code(&Error::Validation {
+                field: "x".into(),
+                reason: String::new(),
+            }),
+            1
+        );
     }
 }

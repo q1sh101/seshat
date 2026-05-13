@@ -1,5 +1,6 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::error::Error;
 
@@ -126,12 +127,17 @@ fn lookup_home_for_user(user: &str) -> Option<PathBuf> {
 
 // Ignores SUDO_USER=root so a root-to-root sudo does not redirect state.
 pub fn sudo_user_home() -> Option<PathBuf> {
-    let user = non_empty_env("SUDO_USER")?;
-    let user_str = user.to_str()?;
-    if user_str == "root" {
-        return None;
-    }
-    lookup_home_for_user(user_str)
+    static SUDO_USER_HOME: OnceLock<Option<PathBuf>> = OnceLock::new();
+    SUDO_USER_HOME
+        .get_or_init(|| {
+            let user = non_empty_env("SUDO_USER")?;
+            let user_str = user.to_str()?;
+            if user_str == "root" {
+                return None;
+            }
+            lookup_home_for_user(user_str)
+        })
+        .clone()
 }
 
 pub fn state_root() -> Result<PathBuf, Error> {

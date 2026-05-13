@@ -80,12 +80,7 @@ impl DeployReport {
 }
 
 pub fn classify_deploy_error(err: &Error) -> i32 {
-    match err {
-        Error::UnsafePath { .. }
-        | Error::PreflightRefused { .. }
-        | Error::Lock { .. } => 3,
-        _ => 1,
-    }
+    err.exit_code(1)
 }
 
 fn classify_sysctl_summary(summary: &SysctlDeploy) -> i32 {

@@ -16,12 +16,7 @@ pub enum LockReport {
 }
 
 pub fn classify_lock_error(err: &Error) -> i32 {
-    match err {
-        Error::UnsafePath { .. }
-        | Error::PreflightRefused { .. }
-        | Error::Lock { .. } => 3,
-        _ => 1,
-    }
+    err.exit_code(1)
 }
 
 pub fn orchestrate_lock<C, E>(

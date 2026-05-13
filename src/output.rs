@@ -1,4 +1,5 @@
 use std::io::{self, IsTerminal, Write};
+use std::sync::OnceLock;
 
 use crate::result::CheckState;
 
@@ -21,54 +22,29 @@ impl Stylesheet {
     }
 }
 
+fn stylesheet() -> &'static Stylesheet {
+    static STYLESHEET: OnceLock<Stylesheet> = OnceLock::new();
+    STYLESHEET.get_or_init(Stylesheet::detect)
+}
+
 pub fn log(msg: &str) {
-    let _ = write_line(
-        &mut io::stdout(),
-        &Stylesheet::detect(),
-        BLUE,
-        "[seshat] ",
-        msg,
-    );
+    let _ = write_line(&mut io::stdout(), stylesheet(), BLUE, "[seshat] ", msg);
 }
 
 pub fn ok(msg: &str) {
-    let _ = write_line(
-        &mut io::stdout(),
-        &Stylesheet::detect(),
-        GREEN,
-        "[  ok] ",
-        msg,
-    );
+    let _ = write_line(&mut io::stdout(), stylesheet(), GREEN, "[  ok] ", msg);
 }
 
 pub fn warn(msg: &str) {
-    let _ = write_line(
-        &mut io::stderr(),
-        &Stylesheet::detect(),
-        YELLOW,
-        "[warn] ",
-        msg,
-    );
+    let _ = write_line(&mut io::stderr(), stylesheet(), YELLOW, "[warn] ", msg);
 }
 
 pub fn fail(msg: &str) {
-    let _ = write_line(
-        &mut io::stderr(),
-        &Stylesheet::detect(),
-        RED,
-        "[fail] ",
-        msg,
-    );
+    let _ = write_line(&mut io::stderr(), stylesheet(), RED, "[fail] ", msg);
 }
 
 pub fn skip(msg: &str) {
-    let _ = write_line(
-        &mut io::stdout(),
-        &Stylesheet::detect(),
-        DIM,
-        "[skip] ",
-        msg,
-    );
+    let _ = write_line(&mut io::stdout(), stylesheet(), DIM, "[skip] ", msg);
 }
 
 pub fn state(cs: CheckState, msg: &str) {

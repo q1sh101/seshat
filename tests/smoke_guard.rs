@@ -94,9 +94,10 @@ fn guard_status_pre_install_reports_absent() {
     seed(tmp.path());
     let (code, stdout, stderr) = run(tmp.path(), &["guard", "status"]);
     assert_eq!(code, 0, "stderr: {stderr}");
+    let combined = format!("{stdout}{stderr}");
     assert!(
-        stdout.contains("service:    installed=false enabled=false"),
-        "stdout: {stdout}"
+        combined.contains("guard: not installed"),
+        "combined: {combined}"
     );
 }
 
@@ -107,9 +108,10 @@ fn guard_status_post_install_reports_installed() {
     run(tmp.path(), &["guard", "install"]);
     let (code, stdout, stderr) = run(tmp.path(), &["guard", "status"]);
     assert_eq!(code, 0, "stderr: {stderr}");
+    let combined = format!("{stdout}{stderr}");
     assert!(
-        stdout.contains("service:    installed=true"),
-        "stdout: {stdout}"
+        combined.contains("guard: installed"),
+        "combined: {combined}"
     );
 }
 
