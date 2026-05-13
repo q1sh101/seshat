@@ -17,4 +17,4 @@ unsafe_code = "forbid"
 serde     = { version = "1", features = ["derive"] }
 toml      = "0.8"
 tempfile  = "3"
-thiserror = "1"
+thiserror = "2"
