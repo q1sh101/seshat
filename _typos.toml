@@ -1,0 +1,6 @@
+# typos configuration — https://github.com/crate-ci/typos
+
+[default.extend-words]
+# Both "unparseable" and "unparsable" are valid English; the codebase uses the
+# longer form intentionally for explicit cognate with `parse`.
+unparseable = "unparseable"
