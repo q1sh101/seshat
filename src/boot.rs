@@ -17,4 +17,7 @@ pub use plan::{BootPlan, PlanState, plan_boot_params};
 pub use refresh::RefreshBackend;
 pub use refresh::{RefreshStatus, refresh_grub_configuration};
 pub use restore::{BootRestore, restore_boot_from_backup};
-pub use verify::{BootVerify, VerifyRow, read_live_cmdline, verify_boot_params};
+pub use verify::{
+    BootVerify, VerifyRow, read_grub_cfg_resolution, read_grubenv, read_live_cmdline,
+    verify_boot_params, verify_grub_cfg,
+};

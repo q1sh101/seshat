@@ -20,6 +20,7 @@ pub struct VerifyReport {
     pub sysctl: Result<SysctlVerify, Error>,
     pub modules: Result<ModulesVerify, Error>,
     pub boot: Result<BootVerify, Error>,
+    pub boot_grub_cfg: Result<BootVerify, Error>,
     pub lockdown: LockdownRow,
 }
 
@@ -31,6 +32,8 @@ pub struct VerifyInputs<'a> {
     pub allow_path: &'a Path,
     pub block_path: &'a Path,
     pub proc_cmdline_path: &'a Path,
+    pub grub_cfg_path: &'a Path,
+    pub grubenv_path: &'a Path,
     pub modprobe_dropin_path: &'a Path,
     pub sys_lockdown_path: &'a Path,
     pub modprobe_show_config: Option<String>,
@@ -41,6 +44,7 @@ pub fn orchestrate_verify(inputs: &VerifyInputs<'_>) -> VerifyReport {
         sysctl: verify_sysctl_domain(inputs),
         modules: verify_modules_domain(inputs),
         boot: verify_boot_domain(inputs),
+        boot_grub_cfg: verify_boot_grub_cfg_domain(inputs),
         lockdown: verify_lockdown_domain(inputs),
     }
 }
@@ -99,6 +103,18 @@ fn verify_boot_domain(inputs: &VerifyInputs<'_>) -> Result<BootVerify, Error> {
         .map(|e| BootArg::new(&e.arg))
         .collect::<Result<_, _>>()?;
     Ok(boot::verify_boot_params(live.as_deref(), &expected))
+}
+
+fn verify_boot_grub_cfg_domain(inputs: &VerifyInputs<'_>) -> Result<BootVerify, Error> {
+    let env = boot::read_grubenv(inputs.grubenv_path)?;
+    let resolution = boot::read_grub_cfg_resolution(inputs.grub_cfg_path, &env)?;
+    let expected: Vec<BootArg> = inputs
+        .profile
+        .boot
+        .iter()
+        .map(|e| BootArg::new(&e.arg))
+        .collect::<Result<_, _>>()?;
+    Ok(boot::verify_grub_cfg(resolution.as_ref(), &expected))
 }
 
 fn verify_lockdown_domain(inputs: &VerifyInputs<'_>) -> LockdownRow {
@@ -181,6 +197,8 @@ mod tests {
         allow_path: PathBuf,
         block_path: PathBuf,
         proc_cmdline_path: PathBuf,
+        grub_cfg_path: PathBuf,
+        grubenv_path: PathBuf,
         modprobe_dropin_path: PathBuf,
         sys_lockdown_path: PathBuf,
     }
@@ -193,6 +211,8 @@ mod tests {
         let allow_path = root.path().join("allow.conf");
         let block_path = root.path().join("block.conf");
         let proc_cmdline_path = root.path().join("proc_cmdline");
+        let grub_cfg_path = root.path().join("grub.cfg");
+        let grubenv_path = root.path().join("grubenv");
         let modprobe_dropin_path = root.path().join("modprobe.conf");
         let sys_lockdown_path = root.path().join("lockdown");
         fs::create_dir_all(&proc_sys_root).unwrap();
@@ -205,6 +225,8 @@ mod tests {
             allow_path,
             block_path,
             proc_cmdline_path,
+            grub_cfg_path,
+            grubenv_path,
             modprobe_dropin_path,
             sys_lockdown_path,
         }
@@ -223,6 +245,8 @@ mod tests {
             allow_path: &env.allow_path,
             block_path: &env.block_path,
             proc_cmdline_path: &env.proc_cmdline_path,
+            grub_cfg_path: &env.grub_cfg_path,
+            grubenv_path: &env.grubenv_path,
             modprobe_dropin_path: &env.modprobe_dropin_path,
             sys_lockdown_path: &env.sys_lockdown_path,
             modprobe_show_config,

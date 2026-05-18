@@ -343,6 +343,8 @@ fn dispatch_verify(profile: Option<String>, domain: Domain, root: Option<&Path>)
         allow_path: &paths.allow_path,
         block_path: &paths.block_path,
         proc_cmdline_path: &paths.proc_cmdline,
+        grub_cfg_path: &paths.grub_cfg,
+        grubenv_path: &paths.grubenv,
         modprobe_dropin_path: &paths.modprobe_target,
         sys_lockdown_path: &paths.sys_lockdown,
         modprobe_show_config,
@@ -818,6 +820,25 @@ fn render_verify_report(report: &orchestrator::VerifyReport, domain: Domain) -> 
             }
             Err(e) => {
                 output::fail(&format!("verify boot: {e}"));
+                code = code.max(1);
+            }
+        }
+        match &report.boot_grub_cfg {
+            Ok(verify) => {
+                output::log(&format!(
+                    "verify boot grub.cfg: {} row(s)",
+                    verify.rows.len()
+                ));
+                for row in &verify.rows {
+                    output::state(row.state, &format!("{} {}", row.arg.as_str(), row.detail));
+                    emit_hint(row.hint);
+                }
+                if verify.rows.iter().any(row_has_issue) {
+                    code = code.max(1);
+                }
+            }
+            Err(e) => {
+                output::fail(&format!("verify boot grub.cfg: {e}"));
                 code = code.max(1);
             }
         }
@@ -1775,6 +1796,7 @@ struct CliPaths {
     grub_config: PathBuf,
     grub_config_d: PathBuf,
     grub_cfg: PathBuf,
+    grubenv: PathBuf,
     grub_dropin_target: PathBuf,
     kernel_cmdline: PathBuf,
     sys_lockdown: PathBuf,
@@ -1816,6 +1838,7 @@ fn cli_paths(root: Option<&Path>) -> Result<CliPaths, Error> {
         grub_config,
         grub_config_d,
         grub_cfg,
+        grubenv,
         grub_dropin_target,
         kernel_cmdline,
         sys_lockdown,
@@ -1830,6 +1853,7 @@ fn cli_paths(root: Option<&Path>) -> Result<CliPaths, Error> {
             r.join("etc/default/grub"),
             r.join("etc/default/grub.d"),
             r.join("boot/grub/grub.cfg"),
+            r.join("boot/grub/grubenv"),
             r.join("etc/default/grub.d/99-kernel-hardening.cfg"),
             r.join("etc/kernel/cmdline"),
             r.join("sys/kernel/security/lockdown"),
@@ -1844,6 +1868,7 @@ fn cli_paths(root: Option<&Path>) -> Result<CliPaths, Error> {
             PathBuf::from(paths::GRUB_CONFIG),
             PathBuf::from("/etc/default/grub.d"),
             PathBuf::from(paths::GRUB_CFG),
+            PathBuf::from(paths::GRUB_ENV),
             PathBuf::from(paths::GRUB_DROPIN),
             PathBuf::from(paths::KERNEL_CMDLINE),
             PathBuf::from(paths::SYS_LOCKDOWN),
@@ -1873,6 +1898,7 @@ fn cli_paths(root: Option<&Path>) -> Result<CliPaths, Error> {
         grub_config,
         grub_config_d,
         grub_cfg,
+        grubenv,
         grub_dropin_target,
         kernel_cmdline,
         sys_lockdown,

@@ -45,6 +45,7 @@ pub const MODPROBE_DROPIN: &str = "/etc/modprobe.d/99-kernel-hardening.conf";
 pub const GRUB_DROPIN: &str = "/etc/default/grub.d/99-kernel-hardening.cfg";
 pub const GRUB_CONFIG: &str = "/etc/default/grub";
 pub const GRUB_CFG: &str = "/boot/grub/grub.cfg";
+pub const GRUB_ENV: &str = "/boot/grub/grubenv";
 pub const KERNEL_CMDLINE: &str = "/etc/kernel/cmdline";
 
 pub const WATCH_UNIT_STEM: &str = "kernel-hardening-watch";
