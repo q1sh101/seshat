@@ -40,6 +40,22 @@ pub const ALLOWLIST_SNAPSHOT: &str = "allowlist.snapshot.conf";
 pub const ALLOWLIST_ALLOW: &str = "allowlist.allow.conf";
 pub const ALLOWLIST_BLOCK: &str = "allowlist.block.conf";
 
+pub const MODULE_DENY_HELPER: &str = "/usr/libexec/seshat/module-deny";
+
+pub fn module_deny_helper_present() -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let path = PathBuf::from(MODULE_DENY_HELPER);
+    match std::fs::symlink_metadata(&path) {
+        Ok(m) => {
+            m.file_type().is_file()
+                && m.uid() == 0
+                && m.gid() == 0
+                && (m.permissions().mode() & 0o777) == 0o755
+        }
+        Err(_) => false,
+    }
+}
+
 pub const SYSCTL_DROPIN: &str = "/etc/sysctl.d/99-kernel-hardening.conf";
 pub const MODPROBE_DROPIN: &str = "/etc/modprobe.d/99-kernel-hardening.conf";
 pub const GRUB_DROPIN: &str = "/etc/default/grub.d/99-kernel-hardening.cfg";

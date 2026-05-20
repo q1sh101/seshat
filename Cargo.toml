@@ -10,6 +10,10 @@ publish = false
 name = "seshat"
 path = "src/main.rs"
 
+[[bin]]
+name = "module-deny"
+path = "src/bin/module-deny.rs"
+
 [lints.rust]
 unsafe_code = "forbid"
 

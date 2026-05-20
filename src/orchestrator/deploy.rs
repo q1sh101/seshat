@@ -200,12 +200,15 @@ fn deploy_modules_domain(inputs: &DeployInputs<'_>) -> Result<ModulesDeploy, Err
         modules::effective_allowlist(&snapshot, allow.as_deref().unwrap_or(&[]), &combined_block);
     let installed = modules::scan_installed_modules(inputs.modules_dir)?;
 
+    let use_helper =
+        inputs.profile.modules.use_deny_helper && crate::paths::module_deny_helper_present();
     modules::deploy_enforcement(
         &effective,
         &installed,
         inputs.profile.profile_name.as_str(),
         inputs.modprobe_target,
         inputs.modprobe_backup_dir,
+        use_helper,
     )
 }
 
@@ -414,6 +417,7 @@ mod tests {
             modules: ModulesSection {
                 mode: Some("allowlist".to_string()),
                 block: modules_block.iter().map(|s| s.to_string()).collect(),
+                use_deny_helper: false,
             },
             sysctl: sysctl
                 .into_iter()

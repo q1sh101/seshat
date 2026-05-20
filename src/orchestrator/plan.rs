@@ -156,6 +156,7 @@ mod tests {
             modules: ModulesSection {
                 mode: Some("allowlist".to_string()),
                 block: modules_block.iter().map(|s| s.to_string()).collect(),
+                use_deny_helper: false,
             },
             sysctl: sysctl
                 .into_iter()

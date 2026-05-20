@@ -232,10 +232,13 @@ fn compute_modules_drift(inputs: &StatusInputs<'_>, live: Option<&[u8]>) -> Drif
     let Ok(installed) = modules::scan_installed_modules(inputs.modules_dir) else {
         return DriftState::Unknown;
     };
+    let use_helper =
+        inputs.profile.modules.use_deny_helper && crate::paths::module_deny_helper_present();
     let expected = modules::generate_modprobe_dropin(
         &effective,
         &installed,
         inputs.profile.profile_name.as_str(),
+        use_helper,
     );
     match live {
         None => drift_when_unreadable(inputs.modprobe_drop_in),
@@ -355,6 +358,7 @@ mod tests {
             modules: ModulesSection {
                 mode: Some("allowlist".to_string()),
                 block: modules_block.iter().map(|s| s.to_string()).collect(),
+                use_deny_helper: false,
             },
             sysctl: sysctl
                 .into_iter()
@@ -479,6 +483,7 @@ mod tests {
             &effective,
             &["ext4".to_string(), "vfat".to_string()],
             "test",
+            false,
         );
         write_with_mode(&env.modprobe_drop_in, &expected, 0o644);
         let prof = profile(vec![], vec![], vec![]);
@@ -604,7 +609,7 @@ mod tests {
         seed_installed_modules(&env, &["ext4"]);
         let effective = vec![ModuleName::new("ext4").unwrap()];
         let modprobe_expected =
-            modules::generate_modprobe_dropin(&effective, &["ext4".to_string()], "test");
+            modules::generate_modprobe_dropin(&effective, &["ext4".to_string()], "test", false);
         write_with_mode(&env.modprobe_drop_in, &modprobe_expected, 0o644);
         write_with_mode(&env.kernel_cmdline, "rw\n", 0o644);
         fs::create_dir_all(env.modules_disabled_path.parent().unwrap()).unwrap();

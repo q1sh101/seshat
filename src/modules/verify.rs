@@ -4,6 +4,7 @@ use std::path::Path;
 
 use super::dropin::{generate_modprobe_dropin, payload_signature};
 use crate::error::Error;
+use crate::paths::MODULE_DENY_HELPER;
 use crate::policy::{ModuleName, normalize_module};
 use crate::result::CheckState;
 
@@ -26,6 +27,7 @@ pub fn verify_enforcement<F>(
     profile_name: &str,
     deployed_path: &Path,
     modprobe_show_config: F,
+    use_helper: bool,
 ) -> Result<VerifyReport, Error>
 where
     F: FnOnce() -> Option<String>,
@@ -42,7 +44,7 @@ where
         return Ok(VerifyReport { rows });
     };
 
-    let expected = generate_modprobe_dropin(effective, installed, profile_name);
+    let expected = generate_modprobe_dropin(effective, installed, profile_name, use_helper);
     let expected_sig = payload_signature(&expected);
 
     match std::fs::read_to_string(deployed_path) {
@@ -102,7 +104,7 @@ where
             continue;
         }
         match rules.get(&norm) {
-            Some(cmd) if cmd == "/bin/false" => {}
+            Some(cmd) if is_blocking_install_cmd(cmd) => {}
             _ => {
                 conflicts.insert(raw.clone());
             }
@@ -135,6 +137,16 @@ where
     Ok(VerifyReport { rows })
 }
 
+fn is_blocking_install_cmd(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "/bin/false" | "/bin/true" | "/usr/bin/false" | "/usr/bin/true" | "/dev/null"
+    ) || cmd == MODULE_DENY_HELPER
+        || cmd
+            .strip_prefix(MODULE_DENY_HELPER)
+            .is_some_and(|rest| rest.starts_with(' '))
+}
+
 fn parse_modprobe_install_rules(show_config: &str) -> HashMap<String, String> {
     let mut rules: HashMap<String, String> = HashMap::new();
     for raw in show_config.lines() {
@@ -160,6 +172,41 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn is_blocking_install_cmd_accepts_legacy_no_ops() {
+        for cmd in [
+            "/bin/false",
+            "/bin/true",
+            "/usr/bin/false",
+            "/usr/bin/true",
+            "/dev/null",
+        ] {
+            assert!(is_blocking_install_cmd(cmd), "expected blocking for {cmd}");
+        }
+    }
+
+    #[test]
+    fn is_blocking_install_cmd_accepts_helper_invocation() {
+        assert!(is_blocking_install_cmd(
+            "/usr/libexec/seshat/module-deny zram"
+        ));
+        assert!(is_blocking_install_cmd(
+            "/usr/libexec/seshat/module-deny lz4_compress"
+        ));
+    }
+
+    #[test]
+    fn is_blocking_install_cmd_rejects_arbitrary_commands() {
+        assert!(!is_blocking_install_cmd(
+            "/sbin/modprobe --ignore-install usb-storage"
+        ));
+        assert!(!is_blocking_install_cmd("/opt/custom/handler arg"));
+        assert!(!is_blocking_install_cmd(
+            "/usr/libexec/seshat/module-deny-malicious zram"
+        ));
+        assert!(!is_blocking_install_cmd(""));
+    }
+
+    #[test]
     fn parse_modprobe_install_rules_extracts_install_lines() {
         let cfg = "\
 # comment
@@ -182,8 +229,15 @@ options aes foo=1
     fn verify_enforcement_skip_when_no_snapshot() {
         let dir = tempdir().unwrap();
         let deployed = dir.path().join("test-modules.conf");
-        let report =
-            verify_enforcement(None, &[], "baseline", &deployed, || Some(String::new())).unwrap();
+        let report = verify_enforcement(
+            None,
+            &[],
+            "baseline",
+            &deployed,
+            || Some(String::new()),
+            false,
+        )
+        .unwrap();
         assert_eq!(report.rows.len(), 1);
         assert_eq!(report.rows[0].state, CheckState::Skip);
         assert_eq!(report.rows[0].key, "enforcement");
@@ -196,11 +250,15 @@ options aes foo=1
         let deployed = dir.path().join("test-modules.conf");
         let effective = vec![ModuleName::new("ext4").unwrap()];
         let installed = vec!["ext4".to_string(), "vfat".to_string()];
-        let report =
-            verify_enforcement(Some(&effective), &installed, "baseline", &deployed, || {
-                Some(String::new())
-            })
-            .unwrap();
+        let report = verify_enforcement(
+            Some(&effective),
+            &installed,
+            "baseline",
+            &deployed,
+            || Some(String::new()),
+            false,
+        )
+        .unwrap();
         assert_eq!(report.rows[0].state, CheckState::Fail);
         assert!(report.rows[0].detail.starts_with("drop-in missing:"));
         assert_eq!(report.rows[0].hint, "run: seshat deploy modules");
@@ -212,14 +270,18 @@ options aes foo=1
         let deployed = dir.path().join("test-modules.conf");
         let effective = vec![ModuleName::new("ext4").unwrap()];
         let installed = vec!["ext4".to_string(), "vfat".to_string()];
-        let expected = generate_modprobe_dropin(&effective, &installed, "baseline");
+        let expected = generate_modprobe_dropin(&effective, &installed, "baseline", false);
         fs::write(&deployed, &expected).unwrap();
         let cfg = "install vfat /bin/false\n".to_string();
-        let report =
-            verify_enforcement(Some(&effective), &installed, "baseline", &deployed, || {
-                Some(cfg)
-            })
-            .unwrap();
+        let report = verify_enforcement(
+            Some(&effective),
+            &installed,
+            "baseline",
+            &deployed,
+            || Some(cfg),
+            false,
+        )
+        .unwrap();
         assert_eq!(report.rows[0].state, CheckState::Ok);
         assert_eq!(report.rows[0].key, "enforcement");
     }
@@ -231,11 +293,15 @@ options aes foo=1
         fs::write(&deployed, "# header\ninstall extra /bin/false\n").unwrap();
         let effective = vec![ModuleName::new("ext4").unwrap()];
         let installed = vec!["ext4".to_string(), "vfat".to_string()];
-        let report =
-            verify_enforcement(Some(&effective), &installed, "baseline", &deployed, || {
-                Some(String::new())
-            })
-            .unwrap();
+        let report = verify_enforcement(
+            Some(&effective),
+            &installed,
+            "baseline",
+            &deployed,
+            || Some(String::new()),
+            false,
+        )
+        .unwrap();
         assert_eq!(report.rows[0].state, CheckState::Fail);
         assert_eq!(
             report.rows[0].detail,
@@ -249,14 +315,18 @@ options aes foo=1
         let deployed = dir.path().join("test-modules.conf");
         let effective = vec![ModuleName::new("ext4").unwrap()];
         let installed = vec!["ext4".to_string(), "vfat".to_string()];
-        let expected = generate_modprobe_dropin(&effective, &installed, "baseline");
+        let expected = generate_modprobe_dropin(&effective, &installed, "baseline", false);
         let tampered = format!("{expected}install vfat /bin/false\n");
         fs::write(&deployed, &tampered).unwrap();
-        let report =
-            verify_enforcement(Some(&effective), &installed, "baseline", &deployed, || {
-                Some(String::new())
-            })
-            .unwrap();
+        let report = verify_enforcement(
+            Some(&effective),
+            &installed,
+            "baseline",
+            &deployed,
+            || Some(String::new()),
+            false,
+        )
+        .unwrap();
         assert_eq!(report.rows[0].state, CheckState::Fail);
         assert_eq!(
             report.rows[0].detail,
@@ -269,10 +339,11 @@ options aes foo=1
         let dir = tempdir().unwrap();
         let deployed = dir.path().join("test-modules.conf");
         let effective = vec![ModuleName::new("ext4").unwrap()];
-        let expected = generate_modprobe_dropin(&effective, &[], "baseline");
+        let expected = generate_modprobe_dropin(&effective, &[], "baseline", false);
         fs::write(&deployed, &expected).unwrap();
         let report =
-            verify_enforcement(Some(&effective), &[], "baseline", &deployed, || None).unwrap();
+            verify_enforcement(Some(&effective), &[], "baseline", &deployed, || None, false)
+                .unwrap();
         assert_eq!(report.rows[1].state, CheckState::Warn);
         assert_eq!(report.rows[1].key, "modprobe-config");
         assert!(report.rows[1].detail.contains("cannot inspect"));
@@ -284,14 +355,41 @@ options aes foo=1
         let deployed = dir.path().join("test-modules.conf");
         let effective = vec![ModuleName::new("ext4").unwrap()];
         let installed = vec!["ext4".to_string(), "vfat".to_string()];
-        let expected = generate_modprobe_dropin(&effective, &installed, "baseline");
+        let expected = generate_modprobe_dropin(&effective, &installed, "baseline", false);
         fs::write(&deployed, &expected).unwrap();
         let cfg = "install vfat /bin/false\n".to_string();
-        let report =
-            verify_enforcement(Some(&effective), &installed, "baseline", &deployed, || {
-                Some(cfg)
-            })
-            .unwrap();
+        let report = verify_enforcement(
+            Some(&effective),
+            &installed,
+            "baseline",
+            &deployed,
+            || Some(cfg),
+            false,
+        )
+        .unwrap();
+        assert_eq!(report.rows[1].state, CheckState::Ok);
+        assert_eq!(report.rows[1].key, "modprobe-config");
+    }
+
+    #[test]
+    fn verify_enforcement_ok_when_modprobe_rules_use_helper() {
+        let dir = tempdir().unwrap();
+        let deployed = dir.path().join("test-modules.conf");
+        let effective = vec![ModuleName::new("ext4").unwrap()];
+        let installed = vec!["ext4".to_string(), "vfat".to_string()];
+        let expected = generate_modprobe_dropin(&effective, &installed, "baseline", true);
+        fs::write(&deployed, &expected).unwrap();
+        let cfg = "install vfat /usr/libexec/seshat/module-deny vfat\n".to_string();
+        let report = verify_enforcement(
+            Some(&effective),
+            &installed,
+            "baseline",
+            &deployed,
+            || Some(cfg),
+            true,
+        )
+        .unwrap();
+        assert_eq!(report.rows[0].state, CheckState::Ok);
         assert_eq!(report.rows[1].state, CheckState::Ok);
         assert_eq!(report.rows[1].key, "modprobe-config");
     }
@@ -302,14 +400,18 @@ options aes foo=1
         let deployed = dir.path().join("test-modules.conf");
         let effective = vec![ModuleName::new("ext4").unwrap()];
         let installed = vec!["ext4".to_string(), "vfat".to_string()];
-        let expected = generate_modprobe_dropin(&effective, &installed, "baseline");
+        let expected = generate_modprobe_dropin(&effective, &installed, "baseline", false);
         fs::write(&deployed, &expected).unwrap();
         let cfg = "install vfat /sbin/modprobe --ignore-install vfat\n".to_string();
-        let report =
-            verify_enforcement(Some(&effective), &installed, "baseline", &deployed, || {
-                Some(cfg)
-            })
-            .unwrap();
+        let report = verify_enforcement(
+            Some(&effective),
+            &installed,
+            "baseline",
+            &deployed,
+            || Some(cfg),
+            false,
+        )
+        .unwrap();
         assert_eq!(report.rows[1].state, CheckState::Fail);
         assert!(report.rows[1].detail.contains("vfat"));
     }
@@ -320,13 +422,17 @@ options aes foo=1
         let deployed = dir.path().join("test-modules.conf");
         let effective = vec![ModuleName::new("ext4").unwrap()];
         let installed = vec!["ext4".to_string(), "vfat".to_string()];
-        let expected = generate_modprobe_dropin(&effective, &installed, "baseline");
+        let expected = generate_modprobe_dropin(&effective, &installed, "baseline", false);
         fs::write(&deployed, &expected).unwrap();
-        let report =
-            verify_enforcement(Some(&effective), &installed, "baseline", &deployed, || {
-                Some(String::new())
-            })
-            .unwrap();
+        let report = verify_enforcement(
+            Some(&effective),
+            &installed,
+            "baseline",
+            &deployed,
+            || Some(String::new()),
+            false,
+        )
+        .unwrap();
         assert_eq!(report.rows[0].state, CheckState::Ok);
         assert_eq!(report.rows[1].state, CheckState::Fail);
     }
@@ -337,14 +443,18 @@ options aes foo=1
         let deployed = dir.path().join("test-modules.conf");
         let effective = vec![ModuleName::new("ext4").unwrap()];
         let installed = vec!["ext4".to_string(), "usb-storage".to_string()];
-        let expected = generate_modprobe_dropin(&effective, &installed, "baseline");
+        let expected = generate_modprobe_dropin(&effective, &installed, "baseline", false);
         fs::write(&deployed, &expected).unwrap();
         let cfg = "install usb_storage /bin/false\n".to_string();
-        let report =
-            verify_enforcement(Some(&effective), &installed, "baseline", &deployed, || {
-                Some(cfg)
-            })
-            .unwrap();
+        let report = verify_enforcement(
+            Some(&effective),
+            &installed,
+            "baseline",
+            &deployed,
+            || Some(cfg),
+            false,
+        )
+        .unwrap();
         assert_eq!(report.rows[1].state, CheckState::Ok);
     }
 }

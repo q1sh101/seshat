@@ -21,8 +21,9 @@ pub fn deploy_enforcement(
     profile_name: &str,
     target: &Path,
     backup_dir: &Path,
+    use_helper: bool,
 ) -> Result<DeploySummary, Error> {
-    let payload = generate_modprobe_dropin(effective, installed, profile_name);
+    let payload = generate_modprobe_dropin(effective, installed, profile_name, use_helper);
     let backup = create_backup(target, backup_dir)?;
     install_root_file(target, payload.as_bytes(), 0o644)?;
 
@@ -78,8 +79,15 @@ mod tests {
         let (_dir, target, backup_dir) = deploy_env();
         let effective = vec![ModuleName::new("ext4").unwrap()];
         let installed = vec!["ext4".to_string(), "vfat".to_string()];
-        let summary =
-            deploy_enforcement(&effective, &installed, "baseline", &target, &backup_dir).unwrap();
+        let summary = deploy_enforcement(
+            &effective,
+            &installed,
+            "baseline",
+            &target,
+            &backup_dir,
+            false,
+        )
+        .unwrap();
         assert_eq!(summary.target, target);
         assert_eq!(summary.allow_count, 1);
         assert_eq!(summary.block_count, 1);
@@ -95,8 +103,15 @@ mod tests {
         fs::write(&target, "prior content\n").unwrap();
         let effective = vec![ModuleName::new("ext4").unwrap()];
         let installed = vec!["ext4".to_string()];
-        let summary =
-            deploy_enforcement(&effective, &installed, "baseline", &target, &backup_dir).unwrap();
+        let summary = deploy_enforcement(
+            &effective,
+            &installed,
+            "baseline",
+            &target,
+            &backup_dir,
+            false,
+        )
+        .unwrap();
         let backup = summary.backup.expect("existing file must be backed up");
         let backup_content = fs::read_to_string(&backup).unwrap();
         assert_eq!(backup_content, "prior content\n");
@@ -107,7 +122,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let (_dir, target, backup_dir) = deploy_env();
         let effective = vec![ModuleName::new("ext4").unwrap()];
-        deploy_enforcement(&effective, &[], "baseline", &target, &backup_dir).unwrap();
+        deploy_enforcement(&effective, &[], "baseline", &target, &backup_dir, false).unwrap();
         let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o644);
     }
@@ -122,8 +137,15 @@ mod tests {
             "usb-storage".to_string(),
             "nouveau".to_string(),
         ];
-        let summary =
-            deploy_enforcement(&effective, &installed, "baseline", &target, &backup_dir).unwrap();
+        let summary = deploy_enforcement(
+            &effective,
+            &installed,
+            "baseline",
+            &target,
+            &backup_dir,
+            false,
+        )
+        .unwrap();
         assert_eq!(summary.allow_count, 1);
         assert_eq!(summary.block_count, 3);
     }
@@ -133,10 +155,25 @@ mod tests {
         let (_dir, target, backup_dir) = deploy_env();
         let effective = vec![ModuleName::new("ext4").unwrap()];
         let installed = vec!["ext4".to_string(), "vfat".to_string()];
-        deploy_enforcement(&effective, &installed, "baseline", &target, &backup_dir).unwrap();
+        deploy_enforcement(
+            &effective,
+            &installed,
+            "baseline",
+            &target,
+            &backup_dir,
+            false,
+        )
+        .unwrap();
         let first = fs::read_to_string(&target).unwrap();
-        let second_summary =
-            deploy_enforcement(&effective, &installed, "baseline", &target, &backup_dir).unwrap();
+        let second_summary = deploy_enforcement(
+            &effective,
+            &installed,
+            "baseline",
+            &target,
+            &backup_dir,
+            false,
+        )
+        .unwrap();
         let second = fs::read_to_string(&target).unwrap();
         assert_eq!(first, second);
         assert!(second_summary.backup.is_some());
@@ -151,8 +188,8 @@ mod tests {
         fs::remove_file(&target).ok();
         symlink(&real, &target).unwrap();
         let effective = vec![ModuleName::new("ext4").unwrap()];
-        let err =
-            deploy_enforcement(&effective, &[], "baseline", &target, &backup_dir).unwrap_err();
+        let err = deploy_enforcement(&effective, &[], "baseline", &target, &backup_dir, false)
+            .unwrap_err();
         assert!(matches!(err, Error::UnsafePath { .. }));
     }
 }

@@ -486,12 +486,20 @@ fn deploy_modules_only(profile: &Profile, paths: &CliPaths) -> i32 {
         Ok(v) => v,
         Err(e) => return print_error_exit(&e, 1),
     };
+    let use_helper = profile.modules.use_deny_helper && paths::module_deny_helper_present();
+    if profile.modules.use_deny_helper && !use_helper {
+        output::warn(&format!(
+            "module-deny helper missing at {}, falling back to /bin/false",
+            paths::MODULE_DENY_HELPER
+        ));
+    }
     match modules::deploy_enforcement(
         &effective,
         &installed,
         profile.profile_name.as_str(),
         &paths.modprobe_target,
         &paths.modules_backup_dir,
+        use_helper,
     ) {
         Ok(summary) => {
             output::ok(&format!(

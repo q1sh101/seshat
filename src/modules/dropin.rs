@@ -4,6 +4,7 @@ use std::path::Path;
 
 use super::names::strip_module_suffix;
 use crate::error::Error;
+use crate::paths::MODULE_DENY_HELPER;
 use crate::policy::{ModuleName, normalize_module};
 
 // Refuse missing root: a header-only drop-in would silently block nothing.
@@ -59,6 +60,7 @@ pub fn generate_modprobe_dropin(
     effective: &[ModuleName],
     installed: &[String],
     profile_name: &str,
+    use_helper: bool,
 ) -> String {
     let allowed: HashSet<String> = effective
         .iter()
@@ -78,9 +80,11 @@ pub fn generate_modprobe_dropin(
     out.push_str("# mode: allowlist (auto-generated blocklist)\n");
     out.push_str("# source: snapshot ∪ allow − block\n\n");
     for name in &blocked {
-        out.push_str("install ");
-        out.push_str(name);
-        out.push_str(" /bin/false\n");
+        if use_helper {
+            out.push_str(&format!("install {name} {MODULE_DENY_HELPER} {name}\n"));
+        } else {
+            out.push_str(&format!("install {name} /bin/false\n"));
+        }
     }
     out
 }
@@ -187,7 +191,7 @@ mod tests {
             "vfat".to_string(),
             "usb-storage".to_string(),
         ];
-        let out = generate_modprobe_dropin(&effective, &installed, "baseline");
+        let out = generate_modprobe_dropin(&effective, &installed, "baseline", false);
         assert!(out.starts_with("# managed by seshat\n"));
         assert!(out.contains("# profile: baseline"));
         assert!(!out.contains("install ext4"));
@@ -199,7 +203,7 @@ mod tests {
     fn generate_modprobe_dropin_treats_hyphen_and_underscore_as_equivalent() {
         let effective = vec![ModuleName::new("usb_storage").unwrap()];
         let installed = vec!["usb-storage".to_string()];
-        let out = generate_modprobe_dropin(&effective, &installed, "x");
+        let out = generate_modprobe_dropin(&effective, &installed, "x", false);
         assert!(!out.contains("install usb-storage"));
     }
 
@@ -207,7 +211,7 @@ mod tests {
     fn generate_modprobe_dropin_output_is_sorted() {
         let effective: Vec<ModuleName> = Vec::new();
         let installed = vec!["zram".to_string(), "aes".to_string(), "btrfs".to_string()];
-        let out = generate_modprobe_dropin(&effective, &installed, "x");
+        let out = generate_modprobe_dropin(&effective, &installed, "x", false);
         let install_lines: Vec<&str> = out.lines().filter(|l| l.starts_with("install ")).collect();
         assert_eq!(
             install_lines,
@@ -226,7 +230,7 @@ mod tests {
             ModuleName::new("vfat").unwrap(),
         ];
         let installed = vec!["ext4".to_string(), "vfat".to_string()];
-        let out = generate_modprobe_dropin(&effective, &installed, "x");
+        let out = generate_modprobe_dropin(&effective, &installed, "x", false);
         assert!(!out.lines().any(|l| l.starts_with("install ")));
     }
 

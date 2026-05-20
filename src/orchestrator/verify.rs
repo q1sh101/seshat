@@ -85,12 +85,15 @@ fn verify_modules_domain(inputs: &VerifyInputs<'_>) -> Result<ModulesVerify, Err
     };
 
     let cfg = inputs.modprobe_show_config.clone();
+    let use_helper =
+        inputs.profile.modules.use_deny_helper && crate::paths::module_deny_helper_present();
     modules::verify_enforcement(
         effective.as_deref(),
         &installed,
         inputs.profile.profile_name.as_str(),
         inputs.modprobe_dropin_path,
         move || cfg,
+        use_helper,
     )
 }
 
@@ -265,6 +268,7 @@ mod tests {
             modules: ModulesSection {
                 mode: Some("allowlist".to_string()),
                 block: modules_block.iter().map(|s| s.to_string()).collect(),
+                use_deny_helper: false,
             },
             sysctl: sysctl
                 .into_iter()

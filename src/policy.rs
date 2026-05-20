@@ -25,13 +25,33 @@ pub struct Profile {
     pub lockdown: LockdownSection,
 }
 
-#[derive(Debug, Clone, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModulesSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub block: Vec<String>,
+    #[serde(default = "default_use_deny_helper", skip_serializing_if = "is_true")]
+    pub use_deny_helper: bool,
+}
+
+impl Default for ModulesSection {
+    fn default() -> Self {
+        Self {
+            mode: None,
+            block: Vec::new(),
+            use_deny_helper: true,
+        }
+    }
+}
+
+fn default_use_deny_helper() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Deserialize, Serialize)]
@@ -561,6 +581,7 @@ profile_name = "x"
             modules: ModulesSection {
                 mode: Some("allowlist".to_string()),
                 block: vec!["usb-storage".to_string()],
+                use_deny_helper: true,
             },
             sysctl: vec![SysctlEntry {
                 key: "kernel.kptr_restrict".to_string(),
@@ -847,6 +868,7 @@ surprise = true
             modules: ModulesSection {
                 mode: None,
                 block: block.into_iter().map(String::from).collect(),
+                use_deny_helper: true,
             },
             sysctl,
             boot: boot
