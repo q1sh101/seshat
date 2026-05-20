@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use boot::{BootRestore, RefreshStatus};
 use cli::{Command, Domain, GuardCmd, ModulesCmd, SnapshotCmd, WatchCmd};
 use error::Error;
-use modules::{ModulesLockOutcome, ModulesRestore, PendingReport};
+use modules::{ModulesLockOutcome, ModulesRestore, PendingReport, PendingSource};
 use orchestrator::{
     DeployInputs, LockInputs, LockReport, PlanInputs, RollbackDomain, RollbackInputs,
     RollbackOutcome, StatusInputs, VerifyInputs, classify_deploy_error, orchestrate_deploy,
@@ -205,29 +205,52 @@ fn dispatch_modules_list(root: Option<&Path>) -> i32 {
 }
 
 fn dispatch_modules_pending(root: Option<&Path>) -> i32 {
-    // Under --root the real journal is off-limits; force Unavailable so smoke tests stay hermetic.
-    let report = modules::check_pending_modules(|| {
-        if root.is_some() {
-            return None;
+    let sources = if root.is_some() {
+        modules::PendingSources::default()
+    } else {
+        let pending_log = paths::pending_log_path();
+        let state_file = match std::fs::read_to_string(&pending_log) {
+            Ok(s) => Some(s),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                output::log(&format!(
+                    "helper source unreadable at {} (run with sudo for [helper] entries)",
+                    pending_log.display()
+                ));
+                None
+            }
+            Err(_) => None,
+        };
+        modules::PendingSources {
+            state_file,
+            kmsg: runtime::run_sanitized("dmesg", std::iter::empty::<&str>())
+                .ok()
+                .filter(|out| out.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).into_owned()),
+            journal: runtime::run_sanitized("journalctl", ["-b", "--no-pager"])
+                .ok()
+                .filter(|out| out.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).into_owned()),
         }
-        runtime::run_sanitized("journalctl", ["-b", "-k", "--no-pager"])
-            .ok()
-            .filter(|out| out.success())
-            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
-    });
+    };
+    let report = modules::check_pending_modules(sources);
     match report {
         PendingReport::Unavailable => {
-            output::skip("pending: unavailable (no journal)");
+            output::skip("pending: unavailable (no source)");
             0
         }
-        PendingReport::Checked(mods) if mods.is_empty() => {
+        PendingReport::Checked(entries) if entries.is_empty() => {
             output::ok("pending: no blocked module requests found");
             0
         }
-        PendingReport::Checked(mods) => {
-            output::log(&format!("pending: {} blocked request(s)", mods.len()));
-            for m in &mods {
-                output::warn(m.as_str());
+        PendingReport::Checked(entries) => {
+            output::log(&format!("pending: {} blocked request(s)", entries.len()));
+            for entry in &entries {
+                let tag = match entry.source {
+                    PendingSource::Kernel => "[kernel]",
+                    PendingSource::Modprobe => "[modprobe.d]",
+                    PendingSource::Helper => "[helper]",
+                };
+                output::warn(&format!("{} {}", tag, entry.name.as_str()));
             }
             output::log("use: seshat modules allow <module> to allow");
             0

@@ -39,8 +39,11 @@ pub const ENV_LOCK_ROOT: &str = "SESHAT_LOCK_ROOT";
 pub const ALLOWLIST_SNAPSHOT: &str = "allowlist.snapshot.conf";
 pub const ALLOWLIST_ALLOW: &str = "allowlist.allow.conf";
 pub const ALLOWLIST_BLOCK: &str = "allowlist.block.conf";
+pub const PENDING_LOG: &str = "pending.log";
 
+pub const SYSTEM_STATE_DIR: &str = "/var/lib/seshat";
 pub const MODULE_DENY_HELPER: &str = "/usr/libexec/seshat/module-deny";
+pub const ENV_PENDING_LOG: &str = "SESHAT_PENDING_LOG";
 
 pub fn module_deny_helper_present() -> bool {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -54,6 +57,16 @@ pub fn module_deny_helper_present() -> bool {
         }
         Err(_) => false,
     }
+}
+
+pub fn pending_log_path() -> PathBuf {
+    if let Some(v) = std::env::var_os(ENV_PENDING_LOG) {
+        return PathBuf::from(v);
+    }
+    if let Some(v) = std::env::var_os(ENV_STATE_ROOT) {
+        return PathBuf::from(v).join(PENDING_LOG);
+    }
+    PathBuf::from(SYSTEM_STATE_DIR).join(PENDING_LOG)
 }
 
 pub const SYSCTL_DROPIN: &str = "/etc/sysctl.d/99-kernel-hardening.conf";

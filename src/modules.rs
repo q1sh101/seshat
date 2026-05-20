@@ -16,7 +16,7 @@ pub use deploy::{DeploySummary, deploy_enforcement};
 pub use dropin::{generate_modprobe_dropin, payload_signature, scan_installed_modules};
 pub use list::list_allowlist;
 pub use overlay::{allow_module, block_module, unallow_module, unblock_module};
-pub use pending::{PendingReport, check_pending_modules};
+pub use pending::{PendingReport, PendingSource, PendingSources, check_pending_modules};
 // PlanState re-exported for orchestrator plan tests; not used by main.rs.
 #[allow(unused_imports)]
 pub use plan::PlanState;
