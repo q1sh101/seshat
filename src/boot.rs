@@ -3,6 +3,7 @@ mod cmdline;
 mod deploy;
 mod dropin;
 mod mainconfig;
+mod pending;
 mod plan;
 mod refresh;
 mod restore;
@@ -11,6 +12,7 @@ mod verify;
 pub use backend::{Backend, default_has_command, detect_backend};
 pub use cmdline::parse_grub_cmdline_default;
 pub use deploy::{deploy_grub_dropin, deploy_grub_main_config};
+pub use pending::{BootPendingInputs, BootPendingKind, BootPendingReport, check_boot_pending};
 pub use plan::{BootPlan, PlanState, plan_boot_params};
 // RefreshBackend re-exported for orchestrator deploy tests; not used by main.rs.
 #[allow(unused_imports)]

@@ -81,6 +81,8 @@ pub enum Command {
     Modules(ModulesCmd),
     Watch(WatchCmd),
     Guard(GuardCmd),
+    BootPending,
+    SysctlPending,
 }
 
 pub const USAGE: &str = "\
@@ -112,6 +114,12 @@ Modules:
   modules unblock  <module>
   modules pending
   modules list     [--profile NAME]
+
+Boot:
+  boot pending
+
+Sysctl:
+  sysctl pending
 
 Service units:
   watch install | remove | status | run
@@ -152,6 +160,8 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         "snapshot" => parse_snapshot(rest),
         "lock" => parse_lock(rest),
         "modules" => parse_modules(rest),
+        "boot" => parse_boot(rest),
+        "sysctl" => parse_sysctl(rest),
         "watch" => parse_watch(rest),
         "guard" => parse_guard(rest),
         other => Err(format!("unknown command: {other}")),
@@ -279,6 +289,32 @@ where
         [name] => Ok(Command::Modules(ctor(name.clone()))),
         [] => Err("missing module name".to_string()),
         [_, extra, ..] => Err(format!("extra argument: {extra}")),
+    }
+}
+
+fn parse_boot(args: &[String]) -> Result<Command, String> {
+    let (sub, rest) = args
+        .split_first()
+        .ok_or_else(|| "boot requires a subcommand".to_string())?;
+    match sub.as_str() {
+        "pending" => {
+            refuse_extras(rest, "boot pending")?;
+            Ok(Command::BootPending)
+        }
+        other => Err(format!("unknown boot subcommand: {other}")),
+    }
+}
+
+fn parse_sysctl(args: &[String]) -> Result<Command, String> {
+    let (sub, rest) = args
+        .split_first()
+        .ok_or_else(|| "sysctl requires a subcommand".to_string())?;
+    match sub.as_str() {
+        "pending" => {
+            refuse_extras(rest, "sysctl pending")?;
+            Ok(Command::SysctlPending)
+        }
+        other => Err(format!("unknown sysctl subcommand: {other}")),
     }
 }
 

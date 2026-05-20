@@ -22,7 +22,7 @@ use std::io::IsTerminal;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use boot::{BootRestore, RefreshStatus};
+use boot::{BootPendingInputs, BootPendingKind, BootPendingReport, BootRestore, RefreshStatus};
 use cli::{Command, Domain, GuardCmd, ModulesCmd, SnapshotCmd, WatchCmd};
 use error::Error;
 use modules::{ModulesLockOutcome, ModulesRestore, PendingReport, PendingSource};
@@ -95,6 +95,8 @@ fn dispatch(command: Command, root: Option<&Path>) -> i32 {
         Command::Lock { yes } => dispatch_lock(yes, root),
         Command::Watch(sub) => dispatch_watch(sub, root),
         Command::Guard(sub) => dispatch_guard(sub, root),
+        Command::BootPending => dispatch_boot_pending(root),
+        Command::SysctlPending => dispatch_sysctl_pending(),
     }
 }
 
@@ -204,7 +206,53 @@ fn dispatch_modules_list(root: Option<&Path>) -> i32 {
     }
 }
 
+fn dispatch_boot_pending(root: Option<&Path>) -> i32 {
+    let expected: Vec<String> = match load_profile(root, None) {
+        Ok(p) => p.boot.iter().map(|b| b.arg.clone()).collect(),
+        Err(_) => Vec::new(),
+    };
+    let inputs = if root.is_some() {
+        BootPendingInputs::default()
+    } else {
+        BootPendingInputs {
+            expected,
+            actual_cmdline: std::fs::read_to_string(paths::PROC_CMDLINE).ok(),
+            dmesg: runtime::run_sanitized("dmesg", std::iter::empty::<&str>())
+                .ok()
+                .filter(|out| out.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).into_owned()),
+        }
+    };
+    match boot::check_boot_pending(inputs) {
+        BootPendingReport::Unavailable => {
+            output::skip("pending: unavailable (no source)");
+            0
+        }
+        BootPendingReport::Checked(entries) if entries.is_empty() => {
+            output::ok("pending: no boot config mismatch or unknown-param evidence");
+            0
+        }
+        BootPendingReport::Checked(entries) => {
+            output::log(&format!("pending: {} entries", entries.len()));
+            for entry in &entries {
+                let tag = match entry.kind {
+                    BootPendingKind::CmdlineMissing => "[cmdline-missing]",
+                    BootPendingKind::UnknownParam => "[unknown-param]",
+                };
+                output::warn(&format!("{} {}", tag, entry.arg));
+            }
+            0
+        }
+    }
+}
+
+fn dispatch_sysctl_pending() -> i32 {
+    output::skip("sysctl pending: N/A by design (drift covers sysctl mutations)");
+    0
+}
+
 fn dispatch_modules_pending(root: Option<&Path>) -> i32 {
+    // Under --root real journal/kmsg are off-limits; force Unavailable so smoke tests stay hermetic.
     let sources = if root.is_some() {
         modules::PendingSources::default()
     } else {
